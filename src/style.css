@@ -204,7 +204,80 @@ dd { margin: 2px 0 0; }
 .swatch.idfg { background: #52b788; }
 .swatch.county { background: #6c757d; }
 
+.sheet.siteplan { max-height: 62vh; }
+.sheet .row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+  gap: 8px;
+}
+.sheet .row label, .sheet label { font-size: 12px; color: var(--muted); }
+.sheet input[type="text"],
+.sheet input[type="number"],
+.sheet textarea {
+  width: 100%;
+  margin-top: 4px;
+  padding: 8px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: #0e1a14;
+  color: var(--ink);
+  font: inherit;
+}
+.sheet .check { display: flex; align-items: center; gap: 8px; margin-top: 22px; }
+.btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+.btn-row .ghost { width: auto; height: 38px; }
+.btn-row .ghost.active { outline: 2px solid var(--gold); }
+.measures { list-style: none; padding: 0; margin: 8px 0; font-size: 13px; }
+.measures li { padding: 3px 0; border-bottom: 1px solid var(--line); }
+.north {
+  position: absolute;
+  left: 14px;
+  bottom: calc(var(--safe-bottom) + 56px);
+  z-index: 4;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  display: grid;
+  place-items: center;
+  font-weight: 700;
+}
+.north::after {
+  content: "";
+  position: absolute;
+  top: -8px;
+  border-left: 6px solid transparent;
+  border-right: 6px solid transparent;
+  border-bottom: 10px solid var(--accent);
+}
+
+.print-only { display: none; }
+
 @media (min-width: 720px) {
   .search, .sheet { max-width: 420px; }
   .sheet { left: auto; right: 12px; }
+}
+
+@media print {
+  @page { size: letter portrait; margin: 0.45in; }
+  html, body, #app { height: auto; background: #fff; color: #111; overflow: visible; }
+  .no-print, .maplibregl-ctrl-top-right, .maplibregl-ctrl-bottom-right { display: none !important; }
+  #map {
+    position: relative;
+    height: 7.4in;
+    border: 1px solid #111;
+  }
+  .north {
+    display: grid;
+    background: #fff;
+    color: #111;
+    border-color: #111;
+    left: 0.2in;
+    bottom: 0.2in;
+  }
+  .print-only { display: block; margin-top: 10px; font-size: 11px; line-height: 1.35; }
+  .print-only h1 { font-size: 14px; margin: 0 0 6px; }
+  .print-disclaimer { font-size: 9px; color: #333; }
+  .maplibregl-ctrl-bottom-left { bottom: 8px; }
 }

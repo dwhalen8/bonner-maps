@@ -28,6 +28,9 @@ iOS only allows GPS in a home-screen web app or over HTTPS. If the blue dot is b
 - Search by street address, owner, or PIN
 - Follow-me GPS and “who owns the dirt under me”
 - Offline pack: parcels, addresses, and USGS topo tiles for the whole county (satellite still needs cell)
+- **BLP site map:** select a parcel → **Make BLP site map** → place the proposed structure, well, and septic → print or save PDF
+
+Bonner County Building Location Permits (BCRC 11-105) need a site plan showing the structure and distances from its greatest projections to every property line, plus environmental features. This draft map is a starting point for that drawing — not a survey and not the official application.
 
 ## Deploy on Dokploy (Hostinger VPS)
 

@@ -221,12 +221,38 @@ export function highlightParcel(map: maplibregl.Map, pin: string | null) {
 }
 
 export function queryParcelAt(map: maplibregl.Map, point: maplibregl.PointLike) {
+  const feat = queryParcelFeature(map, point);
+  return feat?.properties ?? null;
+}
+
+export function queryParcelFeature(map: maplibregl.Map, point: maplibregl.PointLike) {
   const hits = map.queryRenderedFeatures(point, {
     layers: ["parcels-fill-private", "parcels-fill-public", "parcels-line"],
   });
   const hit = hits[0];
   if (!hit?.properties) return null;
-  return hit.properties as unknown as ParcelProps;
+  const pin = String(hit.properties.pin ?? "");
+  const fromSource = pin
+    ? map.querySourceFeatures("parcels", { filter: ["==", ["get", "pin"], pin] })[0]
+    : null;
+  const feature = fromSource ?? hit;
+  const geom = feature.geometry;
+  if (geom.type !== "Polygon" && geom.type !== "MultiPolygon") return null;
+  return {
+    properties: feature.properties as unknown as ParcelProps,
+    geometry: geom,
+  };
+}
+
+export function parcelFeatureByPin(map: maplibregl.Map, pin: string) {
+  const hit = map.querySourceFeatures("parcels", { filter: ["==", ["get", "pin"], pin] })[0];
+  if (!hit || (hit.geometry.type !== "Polygon" && hit.geometry.type !== "MultiPolygon")) {
+    return null;
+  }
+  return {
+    properties: hit.properties as unknown as ParcelProps,
+    geometry: hit.geometry,
+  };
 }
 
 export function addLocationDot(map: maplibregl.Map) {
