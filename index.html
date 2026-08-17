@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1"
+    />
+    <meta name="theme-color" content="#0b1510" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Bonner Bounds" />
+    <meta
+      name="description"
+      content="Offline property boundaries for Bonner County, Idaho."
+    />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" href="/icons/icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/icons/icon.svg" />
+    <title>Bonner Bounds</title>
+  </head>
+  <body>
+    <div id="app">
+      <div id="map"></div>
+
+      <header class="chrome top">
+        <div class="brand">
+          <span class="mark" aria-hidden="true"></span>
+          <div>
+            <strong>Bonner Bounds</strong>
+            <small>Bonner County, Idaho</small>
+          </div>
+        </div>
+        <button id="install-btn" class="ghost" hidden>Add to phone</button>
+      </header>
+
+      <form id="search-form" class="search" autocomplete="off">
+        <input
+          id="search-input"
+          type="search"
+          placeholder="Address, owner, or PIN"
+          enterkeyhint="search"
+        />
+        <button type="submit" class="ghost">Search</button>
+        <ul id="search-results" hidden></ul>
+      </form>
+
+      <div class="fab-col">
+        <button id="layers-btn" class="fab" title="Layers" aria-label="Layers">☰</button>
+        <button id="locate-btn" class="fab" title="My location" aria-label="My location">◎</button>
+      </div>
+
+      <aside id="layers-panel" class="sheet layers" hidden>
+        <h2>Layers</h2>
+        <label><input type="checkbox" id="layer-parcels" checked /> Parcel lines</label>
+        <label><input type="checkbox" id="layer-public" checked /> Public land fill</label>
+        <label><input type="checkbox" id="layer-labels" checked /> Owner labels</label>
+        <label><input type="checkbox" id="layer-county" checked /> County outline</label>
+        <ul class="legend">
+          <li><i class="swatch private"></i> Private</li>
+          <li><i class="swatch usfs"></i> Federal / USFS</li>
+          <li><i class="swatch idl"></i> Idaho Dept. of Lands</li>
+          <li><i class="swatch idfg"></i> Fish &amp; Game / parks</li>
+          <li><i class="swatch county"></i> County / city</li>
+        </ul>
+        <fieldset>
+          <legend>Basemap</legend>
+          <label><input type="radio" name="basemap" value="hybrid" checked /> Satellite + lines</label>
+          <label><input type="radio" name="basemap" value="satellite" /> Satellite</label>
+          <label><input type="radio" name="basemap" value="topo" /> Streets / topo</label>
+          <label><input type="radio" name="basemap" value="dark" /> Dark (offline-friendly)</label>
+        </fieldset>
+        <p class="hint" id="offline-status">Checking offline pack…</p>
+        <p class="hint">Saves parcels, addresses, and USGS topo for the whole county. Satellite still needs cell.</p>
+        <button id="offline-btn" class="primary">Save county for offline</button>
+      </aside>
+
+      <section id="parcel-card" class="sheet parcel" hidden>
+        <button id="close-parcel" class="icon-x" aria-label="Close">×</button>
+        <p class="badge" id="parcel-land"></p>
+        <h2 id="parcel-owner"></h2>
+        <p id="parcel-addr" class="addr"></p>
+        <p id="parcel-owner2" class="muted"></p>
+        <dl>
+          <div><dt>PIN</dt><dd id="parcel-pin"></dd></div>
+          <div><dt>Acres</dt><dd id="parcel-acres"></dd></div>
+          <div><dt>Class</dt><dd id="parcel-class"></dd></div>
+          <div><dt>Assessed</dt><dd id="parcel-value"></dd></div>
+          <div><dt>Deed</dt><dd id="parcel-deed"></dd></div>
+        </dl>
+        <p class="disclaimer">
+          Assessor map, not a survey. Lines can be off by many feet. Do not use this
+          to set a fence or decide a property dispute.
+        </p>
+      </section>
+
+      <footer class="chrome bottom">
+        <span id="status">Loading parcels…</span>
+      </footer>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

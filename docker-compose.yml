@@ -1,0 +1,9 @@
+# Dokploy: create a Compose service and point it at this file.
+# Attach your domain in the Dokploy UI (Let's Encrypt). Do not publish
+# host port 80 — Dokploy's proxy reaches the container on port 80.
+services:
+  web:
+    build: .
+    restart: unless-stopped
+    expose:
+      - "80"

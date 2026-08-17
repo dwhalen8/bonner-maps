@@ -1,0 +1,28 @@
+{
+  "name": "bonner-bounds",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host",
+    "data": "node scripts/fetch-parcels.mjs && node scripts/build-tiles.mjs",
+    "data:fetch": "node scripts/fetch-parcels.mjs",
+    "data:tiles": "node scripts/build-tiles.mjs",
+    "docker:build": "docker build -t bonner-bounds .",
+    "docker:run": "docker run --rm -p 8080:80 bonner-bounds"
+  },
+  "dependencies": {
+    "maplibre-gl": "^5.7.1"
+  },
+  "devDependencies": {
+    "@types/geojson": "7946.0.16",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.5",
+    "vite-plugin-pwa": "^1.0.3"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
+  }
+}
