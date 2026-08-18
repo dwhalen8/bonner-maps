@@ -23,7 +23,7 @@
     <div id="app">
       <div id="map"></div>
 
-      <header class="chrome top">
+      <header class="chrome top no-print">
         <div class="brand">
           <span class="mark" aria-hidden="true"></span>
           <div>
@@ -34,7 +34,7 @@
         <button id="install-btn" class="ghost" hidden>Add to phone</button>
       </header>
 
-      <form id="search-form" class="search" autocomplete="off">
+      <form id="search-form" class="search no-print" autocomplete="off">
         <input
           id="search-input"
           type="search"
@@ -45,12 +45,13 @@
         <ul id="search-results" hidden></ul>
       </form>
 
-      <div class="fab-col">
+      <div class="north no-print" aria-hidden="true">N</div>
+      <div class="fab-col no-print">
         <button id="layers-btn" class="fab" title="Layers" aria-label="Layers">☰</button>
         <button id="locate-btn" class="fab" title="My location" aria-label="My location">◎</button>
       </div>
 
-      <aside id="layers-panel" class="sheet layers" hidden>
+      <aside id="layers-panel" class="sheet layers no-print" hidden>
         <h2>Layers</h2>
         <label><input type="checkbox" id="layer-parcels" checked /> Parcel lines</label>
         <label><input type="checkbox" id="layer-public" checked /> Public land fill</label>
@@ -75,7 +76,7 @@
         <button id="offline-btn" class="primary">Save county for offline</button>
       </aside>
 
-      <section id="parcel-card" class="sheet parcel" hidden>
+      <section id="parcel-card" class="sheet parcel no-print" hidden>
         <button id="close-parcel" class="icon-x" aria-label="Close">×</button>
         <p class="badge" id="parcel-land"></p>
         <h2 id="parcel-owner"></h2>
@@ -92,9 +93,66 @@
           Assessor map, not a survey. Lines can be off by many feet. Do not use this
           to set a fence or decide a property dispute.
         </p>
+        <button id="open-siteplan" class="primary">Make BLP site map</button>
       </section>
 
-      <footer class="chrome bottom">
+      <section id="siteplan-panel" class="sheet siteplan no-print" hidden>
+        <button id="close-siteplan" class="icon-x" aria-label="Close site plan">×</button>
+        <h2>BLP site map</h2>
+        <p class="hint" id="site-zone">Select a parcel, then place the proposed structure.</p>
+        <label>Proposed use
+          <input id="site-use" type="text" value="Single-family dwelling" />
+        </label>
+        <div class="row">
+          <label>Setback (ft)
+            <input id="site-setback" type="number" min="0" step="1" value="25" />
+          </label>
+          <label class="check">
+            <input id="site-accessory" type="checkbox" /> Accessory (5 ft)
+          </label>
+        </div>
+        <div class="row">
+          <label>Width (ft)
+            <input id="site-width" type="number" min="4" step="1" value="40" />
+          </label>
+          <label>Length (ft)
+            <input id="site-length" type="number" min="4" step="1" value="60" />
+          </label>
+          <label>Rotation
+            <input id="site-rot" type="number" step="5" value="0" />
+          </label>
+        </div>
+        <div class="btn-row">
+          <button id="place-structure" type="button" class="ghost">Place structure</button>
+          <button id="place-well" type="button" class="ghost">Well</button>
+          <button id="place-septic" type="button" class="ghost">Septic</button>
+        </div>
+        <ul id="site-distances" class="measures"></ul>
+        <label>Notes
+          <textarea id="site-notes" rows="2" placeholder="Driveway, shoreline, slope, wetlands, existing buildings…"></textarea>
+        </label>
+        <button id="print-sitemap" class="primary">Print / save PDF</button>
+        <p class="disclaimer">
+          Draft only. BCRC 11-105 requires distances from the structure’s greatest
+          projections to every property line and environmental features. Confirm setbacks
+          in Tables 12-411 / 12-412. This is not a survey.
+        </p>
+      </section>
+
+      <aside id="print-block" class="print-only">
+        <h1>Bonner County Building Location Permit — Site Plan (draft)</h1>
+        <p id="print-meta"></p>
+        <p id="print-measures"></p>
+        <p id="print-notes"></p>
+        <p class="print-disclaimer">
+          Assessor parcel map, not a land survey. Distances are approximate. Confirm
+          setbacks, floodplain, shorelines, and wetlands with Bonner County Planning
+          (208-265-1458) before construction. Official application:
+          bonnercountyid.gov/building-location-permit
+        </p>
+      </aside>
+
+      <footer class="chrome bottom no-print">
         <span id="status">Loading parcels…</span>
       </footer>
     </div>
