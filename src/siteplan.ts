@@ -32,8 +32,19 @@ export interface SiteState {
   selectedId: string | null;
   placeMode: PlaceMode;
   status: FeatureStatus;
+  widthFt: number;
+  lengthFt: number;
+  rotationDeg: number;
   use: string;
   notes: string;
+  /** Frozen at startSitePlan; persist key. Not the inspector parcel. */
+  draftPin: string | null;
+}
+
+export interface SitePlanSession {
+  pin: string;
+  hadDraft: boolean;
+  lineFtAtStart: number;
 }
 
 export const site: SiteState = {
@@ -48,8 +59,12 @@ export const site: SiteState = {
   selectedId: null,
   placeMode: null,
   status: "proposed",
+  widthFt: 40,
+  lengthFt: 60,
+  rotationDeg: 0,
   use: "Single-family dwelling",
   notes: "",
+  draftPin: null,
 };
 
 const empty = (): FeatureCollection => ({ type: "FeatureCollection", features: [] });
@@ -104,12 +119,13 @@ function loadDraft(pin: string): PlanDoc | null {
 }
 
 let persistTimer = 0;
+let sessionParcel: ParcelProps | null = null;
 
 export function persistDraft() {
   window.clearTimeout(persistTimer);
   persistTimer = 0;
-  if (!site.parcel?.pin || !site.geom) return;
-  const pin = site.parcel.pin;
+  const pin = site.draftPin;
+  if (!pin || !site.geom || !sessionParcel) return;
   const now = new Date().toISOString();
   const doc: PlanDoc = {
     version: PLAN_DOC_VERSION,
@@ -120,7 +136,7 @@ export function persistDraft() {
     lineFt: site.lineFt,
     accessory: site.accessory,
     parcel: {
-      props: toParcelSnapshot(site.parcel),
+      props: toParcelSnapshot(sessionParcel),
       geom: site.geom,
       snapshotAt: now,
     },
@@ -289,34 +305,60 @@ export function fitParcel(map: MapLibreMap, geom: Polygon | MultiPolygon) {
   );
 }
 
-export async function startSitePlan(
+function resetFormDefaults() {
+  site.use = "Single-family dwelling";
+  site.notes = "";
+  site.accessory = false;
+  site.lineFt = 25;
+  site.widthFt = 40;
+  site.lengthFt = 60;
+  site.rotationDeg = 0;
+  site.status = "proposed";
+  site.zoning = null;
+  site.rule = ruleForZone(null);
+}
+
+export function startSitePlan(
   map: MapLibreMap,
   parcel: ParcelProps,
   geom: Polygon | MultiPolygon,
-) {
+): SitePlanSession {
+  persistDraft();
+
   site.active = true;
+  site.draftPin = parcel.pin;
+  sessionParcel = parcel;
   site.parcel = parcel;
   site.geom = geom;
   site.selectedId = null;
   site.placeMode = null;
   site.status = "proposed";
+  site.zoning = null;
+  site.rule = ruleForZone(null);
 
   const draft = parcel.pin ? loadDraft(parcel.pin) : null;
   if (draft) {
-    site.use = typeof draft.use === "string" && draft.use ? draft.use : site.use;
+    site.use = typeof draft.use === "string" && draft.use ? draft.use : "Single-family dwelling";
     site.notes = typeof draft.notes === "string" ? draft.notes : "";
-    site.lineFt = typeof draft.lineFt === "number" ? draft.lineFt : site.lineFt;
+    site.lineFt = typeof draft.lineFt === "number" ? draft.lineFt : 25;
     site.accessory = Boolean(draft.accessory);
     site.features = draft.features;
     const lastStruct = [...site.features].reverse().find((f) => f.kind === "structure");
     site.selectedId = lastStruct?.id ?? site.features.at(-1)?.id ?? null;
     const selected = site.features.find((f) => f.id === site.selectedId);
     if (selected) site.status = selected.status;
+    if (selected?.kind === "structure") {
+      site.widthFt = selected.props.widthFt ?? 40;
+      site.lengthFt = selected.props.lengthFt ?? 60;
+      site.rotationDeg = selected.props.rotationDeg ?? 0;
+    } else {
+      site.widthFt = 40;
+      site.lengthFt = 60;
+      site.rotationDeg = 0;
+    }
   } else {
     site.features = [];
-    site.use = "Single-family dwelling";
-    site.notes = "";
-    site.accessory = false;
+    resetFormDefaults();
   }
 
   addSiteLayers(map);
@@ -329,25 +371,42 @@ export async function startSitePlan(
   });
   fitParcel(map, geom);
   refreshOverlays(map);
-  const [lng, lat] = parcelCentroid(geom);
+  return {
+    pin: parcel.pin,
+    hadDraft: Boolean(draft),
+    lineFtAtStart: site.lineFt,
+  };
+}
+
+export async function refreshSiteZoning(map: MapLibreMap, session: SitePlanSession) {
+  if (!site.geom || site.draftPin !== session.pin) return;
+  const [lng, lat] = parcelCentroid(site.geom);
+  let zoning: string | null = null;
   try {
-    site.zoning = await fetchZoningAt(lng, lat);
+    zoning = await fetchZoningAt(lng, lat);
   } catch {
-    site.zoning = null;
+    zoning = null;
   }
+  if (!site.active || site.draftPin !== session.pin) return;
+  site.zoning = zoning;
   site.rule = ruleForZone(site.zoning);
-  if (!draft && !site.accessory) site.lineFt = site.rule.lineFt;
+  if (!session.hadDraft && !site.accessory && site.lineFt === session.lineFtAtStart) {
+    site.lineFt = site.rule.lineFt;
+  }
   refreshOverlays(map);
 }
 
 export function exitSitePlan(map: MapLibreMap) {
   persistDraft();
   site.active = false;
+  site.draftPin = null;
+  sessionParcel = null;
   site.parcel = null;
   site.geom = null;
   site.placeMode = null;
   site.features = [];
   site.selectedId = null;
+  resetFormDefaults();
   clearSiteLayers(map);
   for (const id of ["parcels-line", "parcels-fill-private", "parcels-fill-public", "parcels-label", "county-outline"]) {
     if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", "visible");
@@ -376,10 +435,10 @@ export function addFeature(kind: SiteKind, center: Position, extras: Partial<Pla
     geom: { type: "Point", coordinates: center },
     onPacket: extras.onPacket ?? true,
     props: {
-      widthFt: extras.props?.widthFt ?? (kind === "structure" ? 40 : undefined),
-      lengthFt: extras.props?.lengthFt ?? (kind === "structure" ? 60 : undefined),
-      rotationDeg: extras.props?.rotationDeg ?? (kind === "structure" ? 0 : undefined),
-      source: extras.props?.source ?? "user",
+      ...(kind === "structure"
+        ? { widthFt: site.widthFt, lengthFt: site.lengthFt, rotationDeg: site.rotationDeg }
+        : {}),
+      source: "user",
       ...extras.props,
     },
   };

@@ -21,6 +21,7 @@ import {
   exitSitePlan,
   handleSiteClick,
   refreshOverlays,
+  refreshSiteZoning,
   removeSelected,
   schedulePersist,
   selectedFeature,
@@ -55,7 +56,12 @@ function acres(value: number) {
   return `${value.toLocaleString(undefined, { maximumFractionDigits: 2 })} ac`;
 }
 
-function showParcel(props: ParcelProps) {
+function showParcel(map: MapLibreMap, props: ParcelProps) {
+  if (site.active) {
+    $("siteplan-panel").hidden = true;
+    exitSitePlan(map);
+    syncSiteForm();
+  }
   site.parcel = props;
   $("layers-panel").hidden = true;
   const card = $("parcel-card");
@@ -127,10 +133,19 @@ function syncSiteForm() {
   const selected = selectedFeature();
   $<HTMLInputElement>("site-existing").checked = (selected?.status ?? site.status) === "existing";
   if (selected?.kind === "structure") {
-    $<HTMLInputElement>("site-width").value = String(selected.props.widthFt ?? 40);
-    $<HTMLInputElement>("site-length").value = String(selected.props.lengthFt ?? 60);
-    $<HTMLInputElement>("site-rot").value = String(selected.props.rotationDeg ?? 0);
+    if (selected.props.widthFt != null) site.widthFt = selected.props.widthFt;
+    if (selected.props.lengthFt != null) site.lengthFt = selected.props.lengthFt;
+    if (selected.props.rotationDeg != null) site.rotationDeg = selected.props.rotationDeg;
   }
+  $<HTMLInputElement>("site-width").value = String(site.widthFt);
+  $<HTMLInputElement>("site-length").value = String(site.lengthFt);
+  $<HTMLInputElement>("site-rot").value = String(site.rotationDeg);
+}
+
+function fillZoneHint() {
+  $("site-zone").textContent = site.zoning
+    ? `${site.zoning} · typical setback ${site.rule.lineFt} ft (${site.rule.source})`
+    : `Looking up zoning · using ${site.lineFt} ft until county GIS answers.`;
 }
 
 async function openSitePlan(map: MapLibreMap, props: ParcelProps, geom: Polygon | MultiPolygon) {
@@ -138,7 +153,12 @@ async function openSitePlan(map: MapLibreMap, props: ParcelProps, geom: Polygon 
   $("layers-panel").hidden = true;
   $("siteplan-panel").hidden = false;
   $("status").textContent = "Site plan · tap Place structure, then tap the lot";
-  await startSitePlan(map, props, geom);
+  const session = startSitePlan(map, props, geom);
+  fillZoneHint();
+  syncSiteForm();
+  renderDistances();
+  await refreshSiteZoning(map, session);
+  if (!site.active || site.draftPin !== session.pin) return;
   $("site-zone").textContent = site.zoning
     ? `${site.zoning} · typical setback ${site.rule.lineFt} ft (${site.rule.source})`
     : `Zoning unavailable · using ${site.lineFt} ft. Confirm Tables 12-411 / 12-412.`;
@@ -161,6 +181,7 @@ function bindSitePlan(map: MapLibreMap) {
   $("close-siteplan").addEventListener("click", () => {
     $("siteplan-panel").hidden = true;
     exitSitePlan(map);
+    syncSiteForm();
     highlightParcel(map, null);
   });
 
@@ -182,15 +203,24 @@ function bindSitePlan(map: MapLibreMap) {
     setLineSetback(map, feet);
     renderDistances();
   });
+  const readSize = () => {
+    site.widthFt = Number(width.value) || 40;
+    site.lengthFt = Number(length.value) || 60;
+    site.rotationDeg = Number(rot.value) || 0;
+  };
   const syncSize = () => {
+    readSize();
     updateSelected({
-      widthFt: Number(width.value) || 40,
-      lengthFt: Number(length.value) || 60,
-      rotationDeg: Number(rot.value) || 0,
+      widthFt: site.widthFt,
+      lengthFt: site.lengthFt,
+      rotationDeg: site.rotationDeg,
     });
     refreshOverlays(map);
     renderDistances();
   };
+  width.addEventListener("input", readSize);
+  length.addEventListener("input", readSize);
+  rot.addEventListener("input", readSize);
   width.addEventListener("change", syncSize);
   length.addEventListener("change", syncSize);
   rot.addEventListener("change", syncSize);
@@ -270,7 +300,7 @@ function bindSearch(map: MapLibreMap) {
           map.flyTo({ center: [hit.lng, hit.lat], zoom: Math.max(map.getZoom(), 15) });
         }
         highlightParcel(map, hit.pin);
-        showParcel({
+        showParcel(map, {
           pin: hit.pin,
           o1: hit.o,
           o2: hit.o2,
@@ -467,7 +497,7 @@ async function boot() {
       }
       highlightParcel(map, feat.properties.pin);
       const fromIndex = findByPin(feat.properties.pin);
-      showParcel({
+      showParcel(map, {
         ...feat.properties,
         o1: feat.properties.o1 || fromIndex?.o || "",
         o2: feat.properties.o2 || fromIndex?.o2 || "",
