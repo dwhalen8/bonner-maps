@@ -22,6 +22,8 @@ import {
   handleSiteClick,
   refreshOverlays,
   removeSelected,
+  schedulePersist,
+  selectedFeature,
   setLineSetback,
   site,
   startSitePlan,
@@ -117,6 +119,20 @@ function fillPrintBlock() {
   $("print-notes").textContent = site.notes;
 }
 
+function syncSiteForm() {
+  $<HTMLInputElement>("site-use").value = site.use;
+  $<HTMLTextAreaElement>("site-notes").value = site.notes;
+  $<HTMLInputElement>("site-accessory").checked = site.accessory;
+  $<HTMLInputElement>("site-setback").value = String(site.lineFt);
+  const selected = selectedFeature();
+  $<HTMLInputElement>("site-existing").checked = (selected?.status ?? site.status) === "existing";
+  if (selected?.kind === "structure") {
+    $<HTMLInputElement>("site-width").value = String(selected.props.widthFt ?? 40);
+    $<HTMLInputElement>("site-length").value = String(selected.props.lengthFt ?? 60);
+    $<HTMLInputElement>("site-rot").value = String(selected.props.rotationDeg ?? 0);
+  }
+}
+
 async function openSitePlan(map: MapLibreMap, props: ParcelProps, geom: Polygon | MultiPolygon) {
   $("parcel-card").hidden = true;
   $("layers-panel").hidden = true;
@@ -126,7 +142,7 @@ async function openSitePlan(map: MapLibreMap, props: ParcelProps, geom: Polygon 
   $("site-zone").textContent = site.zoning
     ? `${site.zoning} · typical setback ${site.rule.lineFt} ft (${site.rule.source})`
     : `Zoning unavailable · using ${site.lineFt} ft. Confirm Tables 12-411 / 12-412.`;
-  $<HTMLInputElement>("site-setback").value = String(site.lineFt);
+  syncSiteForm();
   renderDistances();
 }
 
@@ -153,6 +169,7 @@ function bindSitePlan(map: MapLibreMap) {
   const width = $<HTMLInputElement>("site-width");
   const length = $<HTMLInputElement>("site-length");
   const rot = $<HTMLInputElement>("site-rot");
+  const existing = $<HTMLInputElement>("site-existing");
 
   setback.addEventListener("change", () => {
     setLineSetback(map, Number(setback.value) || 0);
@@ -177,12 +194,19 @@ function bindSitePlan(map: MapLibreMap) {
   width.addEventListener("change", syncSize);
   length.addEventListener("change", syncSize);
   rot.addEventListener("change", syncSize);
+  existing.addEventListener("change", () => {
+    site.status = existing.checked ? "existing" : "proposed";
+    updateSelected({ status: site.status });
+    refreshOverlays(map);
+  });
 
   $("site-use").addEventListener("input", (event) => {
     site.use = (event.target as HTMLInputElement).value;
+    schedulePersist();
   });
   $("site-notes").addEventListener("input", (event) => {
     site.notes = (event.target as HTMLTextAreaElement).value;
+    schedulePersist();
   });
 
   const arm = (id: string, mode: "structure" | "well" | "septic") => {
@@ -192,7 +216,7 @@ function bindSitePlan(map: MapLibreMap) {
         btn.classList.toggle("active", btn.id === id);
       }
       $("status").textContent =
-        mode === "structure" ? "Tap the lot to place the structure" : `Tap the lot to place the ${mode}`;
+        mode === "structure" ? "Tap the lot to place a structure" : `Tap the lot to place the ${mode}`;
     });
   };
   arm("place-structure", "structure");
@@ -214,6 +238,7 @@ function bindSitePlan(map: MapLibreMap) {
       removeSelected();
       refreshOverlays(map);
       renderDistances();
+      syncSiteForm();
     }
   });
 }
@@ -418,15 +443,23 @@ async function boot() {
     $("close-parcel").addEventListener("click", () => hideParcel(map));
 
     map.on("click", (event) => {
-      if (site.active && handleSiteClick(map, [event.lngLat.lng, event.lngLat.lat])) {
-        for (const btn of document.querySelectorAll(".btn-row .ghost")) btn.classList.remove("active");
-        renderDistances();
-        $("status").textContent = site.marks.some((m) => m.kind === "structure")
-          ? "Structure placed · print when the distances look right"
-          : "Placed · add the structure to measure setbacks";
+      if (site.active) {
+        const placing = site.placeMode;
+        if (handleSiteClick(map, [event.lngLat.lng, event.lngLat.lat])) {
+          for (const btn of document.querySelectorAll(".btn-row .ghost")) btn.classList.remove("active");
+          syncSiteForm();
+          renderDistances();
+          if (placing) {
+            $("status").textContent = site.features.some((f) => f.kind === "structure")
+              ? "Structure placed · print when the distances look right"
+              : "Placed · add the structure to measure setbacks";
+          } else {
+            const selected = selectedFeature();
+            if (selected) $("status").textContent = `${selected.label} selected`;
+          }
+        }
         return;
       }
-      if (site.active) return;
       const feat = queryParcelFeature(map, event.point);
       if (!feat) {
         hideParcel(map);
