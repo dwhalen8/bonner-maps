@@ -8,3 +8,6 @@ public/data/*.pmtiles
 public/data/search-index.json
 public/data/meta.json
 *.log
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
