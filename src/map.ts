@@ -215,6 +215,12 @@ export function setLayerVisible(map: maplibregl.Map, id: string, on: boolean) {
   map.setLayoutProperty(id, "visibility", on ? "visible" : "none");
 }
 
+/** Vertex-draw uses double-tap to finish; disable the map's zoom while drawing. */
+export function setDoubleClickZoom(map: maplibregl.Map, on: boolean) {
+  if (on) map.doubleClickZoom.enable();
+  else map.doubleClickZoom.disable();
+}
+
 export function highlightParcel(map: maplibregl.Map, pin: string | null) {
   if (!map.getLayer("parcels-selected")) return;
   map.setFilter("parcels-selected", ["==", ["get", "pin"], pin ?? ""]);

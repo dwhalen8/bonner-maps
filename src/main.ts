@@ -17,18 +17,26 @@ import {
   type BasemapId,
 } from "./map";
 import {
+  canFinishDraw,
   distanceSummary,
+  drawPrompt,
   exitSitePlan,
+  finishDrawing,
   handleSiteClick,
+  isDrawKind,
   refreshOverlays,
   refreshSiteZoning,
   removeSelected,
   schedulePersist,
   selectedFeature,
   setLineSetback,
+  setPlaceMode,
   site,
   startSitePlan,
   updateSelected,
+  wellSepticAdvisory,
+  encroachmentAdvisory,
+  type SiteKind,
 } from "./siteplan";
 import { formatFeet } from "./geo";
 import type { Polygon, MultiPolygon } from "geojson";
@@ -90,7 +98,8 @@ function renderDistances() {
   const list = $("site-distances");
   list.replaceChildren();
   const rows = distanceSummary();
-  if (!rows.length) {
+  const advisories = [...wellSepticAdvisory(), ...encroachmentAdvisory(null)];
+  if (!rows.length && !advisories.length) {
     list.innerHTML = "<li>Place a structure to measure setbacks to each lot line.</li>";
     return;
   }
@@ -98,7 +107,13 @@ function renderDistances() {
     const li = document.createElement("li");
     const ok = row.toBldgFt + 0.5 >= site.lineFt;
     li.textContent = `${row.side} line ${formatFeet(row.lotFt)} · ${formatFeet(row.toBldgFt)} to structure${ok ? "" : " — short of setback"}`;
-    if (!ok) li.style.color = "#ffb4a6";
+    if (!ok) li.classList.add("warn");
+    list.append(li);
+  }
+  for (const msg of advisories) {
+    const li = document.createElement("li");
+    li.textContent = msg;
+    li.classList.add("warn");
     list.append(li);
   }
 }
@@ -118,10 +133,12 @@ function fillPrintBlock() {
   ]
     .filter(Boolean)
     .join("  ·  ");
-  $("print-measures").textContent = distanceSummary()
-    .slice(0, 8)
-    .map((row) => `${row.side}: ${formatFeet(row.toBldgFt)} to structure`)
-    .join("   ");
+  $("print-measures").textContent = [
+    ...distanceSummary()
+      .slice(0, 8)
+      .map((row) => `${row.side}: ${formatFeet(row.toBldgFt)} to structure`),
+    ...wellSepticAdvisory(),
+  ].join("   ");
   $("print-notes").textContent = site.notes;
 }
 
@@ -156,6 +173,7 @@ async function openSitePlan(map: MapLibreMap, props: ParcelProps, geom: Polygon 
   const session = startSitePlan(map, props, geom);
   fillZoneHint();
   syncSiteForm();
+  syncDrawUi();
   renderDistances();
   await refreshSiteZoning(map, session);
   if (!site.active || site.draftPin !== session.pin) return;
@@ -164,6 +182,15 @@ async function openSitePlan(map: MapLibreMap, props: ParcelProps, geom: Polygon 
     : `Zoning unavailable · using ${site.lineFt} ft. Confirm Tables 12-411 / 12-412.`;
   syncSiteForm();
   renderDistances();
+}
+
+function clearPlaceButtons() {
+  for (const btn of document.querySelectorAll(".btn-row .ghost")) btn.classList.remove("active");
+}
+
+function syncDrawUi() {
+  const finish = $<HTMLButtonElement>("finish-draw");
+  finish.disabled = !canFinishDraw();
 }
 
 function bindSitePlan(map: MapLibreMap) {
@@ -182,6 +209,8 @@ function bindSitePlan(map: MapLibreMap) {
     $("siteplan-panel").hidden = true;
     exitSitePlan(map);
     syncSiteForm();
+    syncDrawUi();
+    clearPlaceButtons();
     highlightParcel(map, null);
   });
 
@@ -239,19 +268,44 @@ function bindSitePlan(map: MapLibreMap) {
     schedulePersist();
   });
 
-  const arm = (id: string, mode: "structure" | "well" | "septic") => {
+  const arm = (id: string, mode: SiteKind, prompt: string) => {
     $(id).addEventListener("click", () => {
-      site.placeMode = mode;
+      setPlaceMode(map, mode);
       for (const btn of document.querySelectorAll(".btn-row .ghost")) {
         btn.classList.toggle("active", btn.id === id);
       }
-      $("status").textContent =
-        mode === "structure" ? "Tap the lot to place a structure" : `Tap the lot to place the ${mode}`;
+      $("status").textContent = prompt;
+      syncDrawUi();
     });
   };
-  arm("place-structure", "structure");
-  arm("place-well", "well");
-  arm("place-septic", "septic");
+  arm("place-structure", "structure", "Tap the lot to place a structure");
+  arm("place-well", "well", "Tap the lot to place the well");
+  arm("place-septic", "septic", "Tap the lot to place the septic");
+  arm(
+    "place-driveway",
+    "driveway",
+    "Tap driveway vertices. May start off the lot. Finish or double-tap to complete.",
+  );
+  arm("place-leach", "leach", "Tap leach field vertices on the lot. Finish or double-tap to close.");
+  arm("place-easement", "easement", "Tap easement vertices. Finish or double-tap to complete.");
+
+  $("finish-draw").addEventListener("click", () => {
+    const kind = site.placeMode;
+    const feature = finishDrawing(map);
+    syncDrawUi();
+    syncSiteForm();
+    renderDistances();
+    if (feature) {
+      clearPlaceButtons();
+      const warn = wellSepticAdvisory()[0];
+      $("status").textContent = warn ?? `${feature.label} drawn`;
+      return;
+    }
+    if (isDrawKind(kind)) {
+      $("status").textContent =
+        kind === "driveway" ? "Need at least two vertices" : "Need at least three vertices to close";
+    }
+  });
 
   $("print-sitemap").addEventListener("click", () => {
     fillPrintBlock();
@@ -476,16 +530,24 @@ async function boot() {
       if (site.active) {
         const placing = site.placeMode;
         if (handleSiteClick(map, [event.lngLat.lng, event.lngLat.lat])) {
-          for (const btn of document.querySelectorAll(".btn-row .ghost")) btn.classList.remove("active");
+          if (!site.placeMode) clearPlaceButtons();
+          syncDrawUi();
           syncSiteForm();
           renderDistances();
-          if (placing) {
-            $("status").textContent = site.features.some((f) => f.kind === "structure")
-              ? "Structure placed · print when the distances look right"
-              : "Placed · add the structure to measure setbacks";
+          const warn = wellSepticAdvisory()[0];
+          if (isDrawKind(site.placeMode)) {
+            $("status").textContent = drawPrompt();
+          } else if (isDrawKind(placing)) {
+            $("status").textContent = warn ?? "Drawn · print when the distances look right";
+          } else if (placing) {
+            $("status").textContent =
+              warn ??
+              (site.features.some((f) => f.kind === "structure")
+                ? "Structure placed · print when the distances look right"
+                : "Placed · add the structure to measure setbacks");
           } else {
             const selected = selectedFeature();
-            if (selected) $("status").textContent = `${selected.label} selected`;
+            if (selected) $("status").textContent = warn ?? `${selected.label} selected`;
           }
         }
         return;
@@ -503,6 +565,22 @@ async function boot() {
         o2: feat.properties.o2 || fromIndex?.o2 || "",
         addr: feat.properties.addr || fromIndex?.addr || "",
       });
+    });
+
+    map.on("dblclick", (event) => {
+      if (!site.active || !isDrawKind(site.placeMode)) return;
+      event.preventDefault();
+      const feature = finishDrawing(map);
+      syncDrawUi();
+      syncSiteForm();
+      renderDistances();
+      if (feature) {
+        clearPlaceButtons();
+        const warn = wellSepticAdvisory()[0];
+        $("status").textContent = warn ?? `${feature.label} drawn`;
+      } else {
+        $("status").textContent = drawPrompt();
+      }
     });
 
     map.on("sourcedata", (event) => {

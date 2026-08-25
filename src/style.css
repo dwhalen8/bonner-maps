@@ -228,8 +228,10 @@ dd { margin: 2px 0 0; }
 .btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
 .btn-row .ghost { width: auto; height: 38px; }
 .btn-row .ghost.active { outline: 2px solid var(--gold); }
+.btn-row .ghost:disabled { opacity: 0.45; cursor: not-allowed; }
 .measures { list-style: none; padding: 0; margin: 8px 0; font-size: 13px; }
 .measures li { padding: 3px 0; border-bottom: 1px solid var(--line); }
+.measures li.warn { color: #ffb4a6; }
 .north {
   position: absolute;
   left: 14px;
