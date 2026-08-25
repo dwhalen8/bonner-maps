@@ -16,10 +16,12 @@ import { PLAN_DOC_VERSION, toParcelSnapshot } from "@shared/plan";
 import type { ParcelProps } from "./types";
 import {
   compass,
+  eaveEnvelope,
   feetBetween,
   formatFeet,
   inwardSetback,
   minDistToEdgeFt,
+  nearestOnPolygonFt,
   parcelBbox,
   parcelCentroid,
   parcelEdges,
@@ -29,7 +31,7 @@ import {
 import { fetchZoningAt, ruleForZone, type SetbackRule } from "./setbacks";
 import { addHatchPatterns, setDoubleClickZoom, USE_AREA_HATCH_IDS } from "./map";
 
-export type PointKind = "structure" | "well" | "septic";
+export type PointKind = "structure" | "well" | "septic" | "front_door";
 export type DrawKind = "driveway" | "leach" | "easement" | "use_area";
 export type SiteKind = PointKind | DrawKind;
 export type PlaceMode = null | SiteKind;
@@ -63,6 +65,10 @@ export const WELL_SEPTIC_ADVISORY_FT = 100;
 /** Proposed driveway "meets" a road at this distance (PR 6 checklist). */
 export const DRIVEWAY_MEETS_ROAD_FT = 30;
 
+export const DEFAULT_EAVE_FT = 2;
+export const DOOR_SNAP_FT = 12;
+export const DOOR_REJECT_MSG = "Tap on the building edge (door must sit on the wall/eave).";
+
 export interface SiteState {
   active: boolean;
   parcel: ParcelProps | null;
@@ -80,6 +86,7 @@ export interface SiteState {
   widthFt: number;
   lengthFt: number;
   rotationDeg: number;
+  eaveFt: number;
   use: string;
   notes: string;
   /** Plan = working map; Packet = BLP preview. Filters overlays only — not a second document. */
@@ -111,6 +118,7 @@ export const site: SiteState = {
   widthFt: 40,
   lengthFt: 60,
   rotationDeg: 0,
+  eaveFt: DEFAULT_EAVE_FT,
   use: "Single-family dwelling",
   notes: "",
   view: "plan",
@@ -124,6 +132,7 @@ const SITE_SOURCES = [
   "site-parcel",
   "site-setback",
   "site-edges",
+  "site-envelope",
   "site-structure",
   "site-points",
   "site-driveway",
@@ -148,7 +157,7 @@ export function isDrawKind(kind: string | null | undefined): kind is DrawKind {
 }
 
 export function isPointKind(kind: string | null | undefined): kind is PointKind {
-  return kind === "structure" || kind === "well" || kind === "septic";
+  return kind === "structure" || kind === "well" || kind === "septic" || kind === "front_door";
 }
 
 export function minDrawVertices(kind: DrawKind) {
@@ -198,6 +207,8 @@ function defaultLabel(kind: FeatureKind, status: FeatureStatus, useClass?: strin
       return existing ? "Existing well" : "Well";
     case "septic":
       return existing ? "Existing septic" : "Septic";
+    case "front_door":
+      return "Front door";
     case "driveway":
       return existing ? "Existing driveway" : "Driveway";
     case "leach":
@@ -320,6 +331,17 @@ function structurePoly(feature: PlanFeature) {
   return rectanglePolygon(center, width, length, feature.props.rotationDeg ?? 0);
 }
 
+function structureEaveFt(feature: PlanFeature) {
+  const n = feature.props.eaveFt;
+  return n != null && Number.isFinite(n) && n >= 0 ? n : DEFAULT_EAVE_FT;
+}
+
+function structureEnvelope(feature: PlanFeature) {
+  const poly = structurePoly(feature);
+  if (!poly) return null;
+  return eaveEnvelope(poly, structureEaveFt(feature));
+}
+
 function isDraftFeature(value: unknown): value is PlanFeature {
   if (!value || typeof value !== "object") return false;
   const f = value as PlanFeature;
@@ -337,10 +359,12 @@ function loadDraft(pin: string): PlanDoc | null {
     parsed.features = parsed.features.filter(isDraftFeature).map((f) => {
       const props = { ...(f.props ?? {}) };
       if (f.kind === "use_area") props.useClass = parseUseClass(props.useClass);
+      if (f.kind === "structure") props.eaveFt = props.eaveFt ?? DEFAULT_EAVE_FT;
+      const status = f.status === "existing" ? "existing" : "proposed";
       return {
         ...f,
-        status: f.status === "existing" ? "existing" : "proposed",
-        label: f.label || defaultLabel(f.kind, f.status === "existing" ? "existing" : "proposed", props.useClass),
+        status,
+        label: f.kind === "front_door" ? "Front door" : f.label || defaultLabel(f.kind, status, props.useClass),
         onPacket: f.kind === "use_area" ? f.onPacket === true : f.onPacket !== false,
         props,
       };
@@ -453,6 +477,16 @@ export function addSiteLayers(map: MapLibreMap) {
       },
     });
     map.addLayer({
+      id: "site-envelope-line",
+      type: "line",
+      source: "site-envelope",
+      paint: {
+        "line-color": ["match", ["get", "status"], "existing", "#6c757d", "#c1121f"],
+        "line-width": ["case", ["boolean", ["get", "selected"], false], 2.2, 1.4],
+        "line-dasharray": [3, 2],
+      },
+    });
+    map.addLayer({
       id: "site-structure-fill",
       type: "fill",
       source: "site-structure",
@@ -494,6 +528,8 @@ export function addSiteLayers(map: MapLibreMap) {
           "#0077b6",
           "septic",
           "#9c6644",
+          "front_door",
+          "#c9a227",
           "#333",
         ],
         "circle-stroke-color": "#fff",
@@ -753,6 +789,7 @@ function resetFormDefaults() {
   site.widthFt = 40;
   site.lengthFt = 60;
   site.rotationDeg = 0;
+  site.eaveFt = DEFAULT_EAVE_FT;
   site.status = "proposed";
   site.useClass = "garden";
   site.zoning = null;
@@ -799,10 +836,12 @@ export function startSitePlan(
       site.widthFt = selected.props.widthFt ?? 40;
       site.lengthFt = selected.props.lengthFt ?? 60;
       site.rotationDeg = selected.props.rotationDeg ?? 0;
+      site.eaveFt = selected.props.eaveFt ?? DEFAULT_EAVE_FT;
     } else {
       site.widthFt = 40;
       site.lengthFt = 60;
       site.rotationDeg = 0;
+      site.eaveFt = DEFAULT_EAVE_FT;
     }
     if (selected?.kind === "use_area") site.useClass = parseUseClass(selected.props.useClass);
   } else {
@@ -879,7 +918,8 @@ export function selectedFeature(): PlanFeature | undefined {
 }
 
 export function addFeature(kind: PointKind, center: Position, extras: Partial<PlanFeature> = {}) {
-  if (!site.geom || !pointInParcel(center, site.geom)) return null;
+  if (!site.geom) return null;
+  if (kind !== "front_door" && !pointInParcel(center, site.geom)) return null;
   const status = extras.status ?? site.status;
   const id = extras.id ?? `${kind}-${Date.now()}`;
   const feature: PlanFeature = {
@@ -891,7 +931,12 @@ export function addFeature(kind: PointKind, center: Position, extras: Partial<Pl
     onPacket: extras.onPacket ?? true,
     props: {
       ...(kind === "structure"
-        ? { widthFt: site.widthFt, lengthFt: site.lengthFt, rotationDeg: site.rotationDeg }
+        ? {
+            widthFt: site.widthFt,
+            lengthFt: site.lengthFt,
+            rotationDeg: site.rotationDeg,
+            eaveFt: site.eaveFt,
+          }
         : {}),
       source: "user",
       ...extras.props,
@@ -1132,22 +1177,41 @@ export function refreshOverlays(map: MapLibreMap) {
   const structures = site.features.filter((f) => f.kind === "structure");
   const measured =
     structures.find((f) => f.id === site.selectedId) ?? structures[0];
-  const measuredPoly = measured ? structurePoly(measured) : null;
+  const measuredEnv = measured ? structureEnvelope(measured) : null;
 
   const edges = parcelEdges(site.geom);
   setSrc(map, "site-edges", {
     type: "FeatureCollection",
     features: edges.map((edge) => {
       let label = `${formatFeet(edge.lengthFt)} ${compass(edge.bearing)}`;
-      if (measuredPoly) {
-        const toBldg = minDistToEdgeFt(measuredPoly, edge);
-        label = `${formatFeet(edge.lengthFt)} · ${formatFeet(toBldg)} to bldg`;
+      if (measuredEnv) {
+        const toBldg = minDistToEdgeFt(measuredEnv, edge);
+        label = `${formatFeet(edge.lengthFt)} · ${formatFeet(toBldg)} to projection`;
       }
       return {
         type: "Feature" as const,
         properties: { label },
         geometry: { type: "LineString" as const, coordinates: [edge.start, edge.end] },
       };
+    }),
+  });
+
+  setSrc(map, "site-envelope", {
+    type: "FeatureCollection",
+    features: structures.flatMap((feature) => {
+      if (structureEaveFt(feature) <= 0) return [];
+      const env = structureEnvelope(feature);
+      if (!env) return [];
+      return [
+        {
+          ...env,
+          properties: {
+            id: feature.id,
+            status: feature.status,
+            selected: feature.id === site.selectedId,
+          },
+        },
+      ];
     }),
   });
 
@@ -1173,7 +1237,7 @@ export function refreshOverlays(map: MapLibreMap) {
   setSrc(map, "site-points", {
     type: "FeatureCollection",
     features: site.features
-      .filter((f) => f.kind === "well" || f.kind === "septic")
+      .filter((f) => f.kind === "well" || f.kind === "septic" || f.kind === "front_door")
       .flatMap((f): Feature<Point>[] => {
         const center = featureCenter(f);
         if (!center) return [];
@@ -1226,9 +1290,18 @@ export function refreshOverlays(map: MapLibreMap) {
 }
 
 function pickFeatureAt(lngLat: Position): PlanFeature | null {
-  // Visual order: structures / leach / easement (paint above use-area), then
-  // points and driveway lines, then use-area last so a garden ring cannot steal
-  // taps from the house, well, septic, or driveway it covers.
+  let bestPoint: PlanFeature | null = null;
+  let bestFt = Infinity;
+  for (const feature of site.features) {
+    if (feature.geom.type !== "Point") continue;
+    const dist = feetBetween(feature.geom.coordinates, lngLat);
+    if (dist < bestFt) {
+      bestFt = dist;
+      bestPoint = feature;
+    }
+  }
+  if (bestPoint && bestFt <= DOOR_SNAP_FT) return bestPoint;
+
   for (let i = site.features.length - 1; i >= 0; i--) {
     const feature = site.features[i];
     if (feature.kind === "structure") {
@@ -1244,20 +1317,20 @@ function pickFeatureAt(lngLat: Position): PlanFeature | null {
     }
   }
   let best: PlanFeature | null = null;
-  let bestFt = 25;
+  let bestLine = 25;
   for (const feature of site.features) {
     if (feature.kind === "structure") continue;
     if (feature.geom.type === "Polygon") continue;
     if (feature.geom.type === "Point") {
       const dist = feetBetween(feature.geom.coordinates, lngLat);
-      if (dist < bestFt) {
-        bestFt = dist;
+      if (dist < bestLine) {
+        bestLine = dist;
         best = feature;
       }
     } else if (feature.geom.type === "LineString") {
       const dist = minDistToLineFt(lngLat, feature.geom.coordinates);
-      if (dist < bestFt) {
-        bestFt = dist;
+      if (dist < bestLine) {
+        bestLine = dist;
         best = feature;
       }
     }
@@ -1272,11 +1345,32 @@ function pickFeatureAt(lngLat: Position): PlanFeature | null {
   return null;
 }
 
+function placeFrontDoor(lngLat: Position) {
+  const structures = site.features.filter((f) => f.kind === "structure");
+  const target = structures.find((f) => f.id === site.selectedId) ?? structures[0];
+  const envelope = target ? structureEnvelope(target) : null;
+  if (!envelope) return null;
+  const snap = nearestOnPolygonFt(lngLat, envelope);
+  if (!Number.isFinite(snap.distFt) || snap.distFt > DOOR_SNAP_FT) return null;
+  return addFeature("front_door", snap.point, { label: "Front door" });
+}
+
 export type SiteClickResult = false | "vertex" | "finished" | "rejected" | "placed" | "selected";
 
 export function handleSiteClick(map: MapLibreMap, lngLat: Position): SiteClickResult {
   if (!site.active) return false;
   if (isDrawKind(site.placeMode)) return addDrawVertex(map, lngLat);
+  if (site.placeMode === "front_door") {
+    const feature = placeFrontDoor(lngLat);
+    if (!feature) {
+      const el = document.getElementById("status");
+      if (el) el.textContent = DOOR_REJECT_MSG;
+      return "rejected";
+    }
+    site.placeMode = null;
+    refreshOverlays(map);
+    return "placed";
+  }
   if (isPointKind(site.placeMode)) {
     const feature = addFeature(site.placeMode, lngLat);
     site.placeMode = null;
@@ -1292,18 +1386,38 @@ export function handleSiteClick(map: MapLibreMap, lngLat: Position): SiteClickRe
   return "selected";
 }
 
-export function distanceSummary() {
+export interface DistanceRow {
+  structureId: string;
+  structureLabel: string;
+  eaveFt: number;
+  side: string;
+  lotFt: number;
+  toBldgFt: number;
+}
+
+/** Envelope → every outer-ring lot edge. Packet uses `{ all: true }`; inspector uses selected. */
+export function distanceSummary(opts?: { structureId?: string; all?: boolean }): DistanceRow[] {
   if (!site.geom) return [];
   const structures = site.features.filter((f) => f.kind === "structure");
-  const structure = structures.find((f) => f.id === site.selectedId) ?? structures[0];
-  const poly = structure ? structurePoly(structure) : null;
-  if (!poly) return [];
-  return parcelEdges(site.geom)
-    .filter((e) => e.lengthFt >= 15)
-    .map((edge) => ({
-      side: compass(edge.bearing + 90),
-      lotFt: edge.lengthFt,
-      toBldgFt: minDistToEdgeFt(poly, edge),
-    }))
-    .sort((a, b) => a.toBldgFt - b.toBldgFt);
+  const wantedId = opts?.structureId ?? site.selectedId;
+  const selectedStruct = structures.find((f) => f.id === wantedId);
+  const targets = opts?.all ? structures : selectedStruct ? [selectedStruct] : structures.slice(0, 1);
+  const edges = parcelEdges(site.geom);
+  const rows: DistanceRow[] = [];
+  for (const structure of targets) {
+    const envelope = structureEnvelope(structure);
+    if (!envelope) continue;
+    const chunk = edges
+      .map((edge) => ({
+        structureId: structure.id,
+        structureLabel: structure.label,
+        eaveFt: structureEaveFt(structure),
+        side: compass(edge.bearing + 90),
+        lotFt: edge.lengthFt,
+        toBldgFt: minDistToEdgeFt(envelope, edge),
+      }))
+      .sort((a, b) => a.toBldgFt - b.toBldgFt);
+    rows.push(...chunk);
+  }
+  return rows;
 }

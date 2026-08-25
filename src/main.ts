@@ -18,6 +18,7 @@ import {
 } from "./map";
 import {
   canFinishDraw,
+  DEFAULT_EAVE_FT,
   distanceSummary,
   drawPrompt,
   exitSitePlan,
@@ -110,7 +111,7 @@ function renderDistances() {
   for (const row of rows.slice(0, 8)) {
     const li = document.createElement("li");
     const ok = row.toBldgFt + 0.5 >= site.lineFt;
-    li.textContent = `${row.side} line ${formatFeet(row.lotFt)} · ${formatFeet(row.toBldgFt)} to structure${ok ? "" : " — short of setback"}`;
+    li.textContent = `${row.side} line ${formatFeet(row.lotFt)} · ${formatFeet(row.toBldgFt)} to projection${ok ? "" : " — short of setback"}`;
     if (!ok) li.classList.add("warn");
     list.append(li);
   }
@@ -138,9 +139,10 @@ function fillPrintBlock() {
     .filter(Boolean)
     .join("  ·  ");
   $("print-measures").textContent = [
-    ...distanceSummary()
-      .slice(0, 8)
-      .map((row) => `${row.side}: ${formatFeet(row.toBldgFt)} to structure`),
+    ...distanceSummary({ all: true }).map(
+      (row) =>
+        `${row.structureLabel} (eave ${formatFeet(row.eaveFt)}) · ${row.side}: ${formatFeet(row.toBldgFt)} to projection`,
+    ),
     ...wellSepticAdvisory(),
   ].join("   ");
   $("print-notes").textContent = site.notes;
@@ -183,10 +185,12 @@ function syncSiteForm() {
     if (selected.props.widthFt != null) site.widthFt = selected.props.widthFt;
     if (selected.props.lengthFt != null) site.lengthFt = selected.props.lengthFt;
     if (selected.props.rotationDeg != null) site.rotationDeg = selected.props.rotationDeg;
+    if (selected.props.eaveFt != null) site.eaveFt = selected.props.eaveFt;
   }
   $<HTMLInputElement>("site-width").value = String(site.widthFt);
   $<HTMLInputElement>("site-length").value = String(site.lengthFt);
   $<HTMLInputElement>("site-rot").value = String(site.rotationDeg);
+  $<HTMLInputElement>("site-eave").value = String(site.eaveFt);
   syncViewToggle();
   syncUseAreaFields();
 }
@@ -259,6 +263,7 @@ function bindSitePlan(map: MapLibreMap) {
   const width = $<HTMLInputElement>("site-width");
   const length = $<HTMLInputElement>("site-length");
   const rot = $<HTMLInputElement>("site-rot");
+  const eave = $<HTMLInputElement>("site-eave");
   const existing = $<HTMLInputElement>("site-existing");
 
   setback.addEventListener("change", () => {
@@ -276,6 +281,8 @@ function bindSitePlan(map: MapLibreMap) {
     site.widthFt = Number(width.value) || 40;
     site.lengthFt = Number(length.value) || 60;
     site.rotationDeg = Number(rot.value) || 0;
+    const eaveN = Number(eave.value);
+    site.eaveFt = Number.isFinite(eaveN) && eaveN >= 0 ? eaveN : DEFAULT_EAVE_FT;
   };
   const syncSize = () => {
     readSize();
@@ -283,6 +290,7 @@ function bindSitePlan(map: MapLibreMap) {
       widthFt: site.widthFt,
       lengthFt: site.lengthFt,
       rotationDeg: site.rotationDeg,
+      eaveFt: site.eaveFt,
     });
     refreshOverlays(map);
     renderDistances();
@@ -290,9 +298,11 @@ function bindSitePlan(map: MapLibreMap) {
   width.addEventListener("input", readSize);
   length.addEventListener("input", readSize);
   rot.addEventListener("input", readSize);
+  eave.addEventListener("input", readSize);
   width.addEventListener("change", syncSize);
   length.addEventListener("change", syncSize);
   rot.addEventListener("change", syncSize);
+  eave.addEventListener("change", syncSize);
   existing.addEventListener("change", () => {
     site.status = existing.checked ? "existing" : "proposed";
     updateSelected({ status: site.status });
@@ -337,6 +347,7 @@ function bindSitePlan(map: MapLibreMap) {
   arm("place-structure", "structure", "Tap the lot to place a structure");
   arm("place-well", "well", "Tap the lot to place the well");
   arm("place-septic", "septic", "Tap the lot to place the septic");
+  arm("place-door", "front_door", "Tap the building edge to place the front door");
   arm(
     "place-driveway",
     "driveway",
@@ -595,9 +606,12 @@ async function boot() {
                 ? "Stay on the lot for the leach field"
                 : placing === "use_area"
                   ? "Stay on the lot for the use area"
-                  : "Stay on the lot";
+                  : placing === "front_door"
+                    ? "Tap on the building edge (door must sit on the wall/eave)."
+                    : "Stay on the lot";
             return;
           }
+          if (site.placeMode === "front_door") return;
           if (!site.placeMode) clearPlaceButtons();
           syncDrawUi();
           syncSiteForm();
@@ -607,6 +621,8 @@ async function boot() {
             $("status").textContent = drawPrompt();
           } else if (isDrawKind(placing)) {
             $("status").textContent = warn ?? "Drawn · print when the distances look right";
+          } else if (placing === "front_door") {
+            $("status").textContent = "Front door placed";
           } else if (placing) {
             $("status").textContent =
               warn ??

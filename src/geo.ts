@@ -81,6 +81,20 @@ export function inwardSetback(geom: Polygon | MultiPolygon, feet: number) {
   }
 }
 
+/** Outward permit envelope: eaves/decks around a structure rectangle. */
+export function eaveEnvelope(
+  poly: Feature<Polygon>,
+  eaveFt: number,
+): Feature<Polygon | MultiPolygon> {
+  const feet = Number.isFinite(eaveFt) ? Math.max(0, eaveFt) : 0;
+  if (feet === 0) return poly;
+  try {
+    return buffer(poly, feet, { units: "feet" }) ?? poly;
+  } catch {
+    return poly;
+  }
+}
+
 export function pointInParcel(lngLat: Position, geom: Polygon | MultiPolygon) {
   return booleanPointInPolygon(point(lngLat), asPolygon(geom));
 }
@@ -130,16 +144,36 @@ export function compass(bearingDeg: number) {
   return dirs[Math.round(bearingDeg / 45) % 8];
 }
 
-export function minDistToEdgeFt(from: Feature<Polygon>, edge: EdgeMeasure) {
+export function minDistToEdgeFt(from: Feature<Polygon | MultiPolygon>, edge: EdgeMeasure) {
   const line = lineString([edge.start, edge.end]);
   let min = Infinity;
-  for (const ring of from.geometry.coordinates) {
+  for (const ring of outerRings(from.geometry)) {
     for (const pt of ring) {
       const snapped = nearestPointOnLine(line, point(pt), { units: "feet" });
       min = Math.min(min, snapped.properties.dist ?? Infinity);
     }
   }
   return min;
+}
+
+export function nearestOnPolygonFt(
+  from: Position,
+  poly: Feature<Polygon | MultiPolygon>,
+): { point: Position; distFt: number } {
+  const line = polygonToLine(poly);
+  const features = line.type === "FeatureCollection" ? line.features : [line];
+  let best: Position = from;
+  let min = Infinity;
+  for (const feat of features) {
+    if (feat.geometry.type !== "LineString" && feat.geometry.type !== "MultiLineString") continue;
+    const snapped = nearestPointOnLine(feat as never, point(from), { units: "feet" });
+    const d = snapped.properties.dist ?? Infinity;
+    if (d < min) {
+      min = d;
+      best = snapped.geometry.coordinates;
+    }
+  }
+  return { point: best, distFt: min };
 }
 
 export function minDistToParcelFt(from: Position, geom: Polygon | MultiPolygon) {
