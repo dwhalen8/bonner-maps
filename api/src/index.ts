@@ -3,6 +3,7 @@ import { Hono } from "hono";
 import { mkdirSync } from "node:fs";
 import { assertMailerForProduction, mountAuth } from "./auth";
 import { migrate, metrics, openDatabase } from "./db";
+import { mountPlans } from "./plans";
 
 const DATABASE_PATH = process.env.DATABASE_PATH ?? "./data/bonner.sqlite";
 const UPLOAD_DIR = process.env.UPLOAD_DIR ?? "./data/uploads";
@@ -53,6 +54,7 @@ api.get("/healthz", (c) => {
 });
 
 mountAuth(api, db);
+mountPlans(api, db);
 
 const app = new Hono();
 app.route("/api", api);

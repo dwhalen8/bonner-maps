@@ -582,7 +582,9 @@ async function readCallbackToken(c: Context): Promise<string> {
   return fromQuery;
 }
 
-function sessionUser(db: Db, raw: string | undefined) {
+export type SessionUser = { id: string; email: string; createdAt: string };
+
+function sessionUser(db: Db, raw: string | undefined): SessionUser | null {
   if (!raw) return null;
   const row = db
     .prepare(
@@ -591,10 +593,12 @@ function sessionUser(db: Db, raw: string | undefined) {
        JOIN users u ON u.id = s.user_id
        WHERE s.id = ? AND s.expires_at > ?`,
     )
-    .get(sha256hex(raw), new Date().toISOString()) as
-    | { id: string; email: string; createdAt: string }
-    | undefined;
+    .get(sha256hex(raw), new Date().toISOString()) as SessionUser | undefined;
   return row ?? null;
+}
+
+export function userFromRequest(db: Db, c: Context): SessionUser | null {
+  return sessionUser(db, getCookie(c, COOKIE));
 }
 
 export function mountAuth(api: Hono, db: Db): void {

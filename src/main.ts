@@ -4,6 +4,16 @@ import type { Map as MapLibreMap } from "maplibre-gl";
 import type { DataMeta, ParcelProps } from "./types";
 import { LAND_LABELS } from "./types";
 import { logout, me, requestOtp, verifyOtp, type Me } from "./auth";
+import { toParcelSnapshot } from "@shared/plan";
+import {
+  claimPlan,
+  planByPin,
+  pullPlans,
+  setPlanStoreHooks,
+  type ConflictChoice,
+  type RevConflict,
+  type StoredPlan,
+} from "./plan-store";
 import {
   addDataLayers,
   addLocationDot,
@@ -19,7 +29,11 @@ import {
   type BasemapId,
 } from "./map";
 import {
+  ackServerRev,
+  applyClaimedPlan,
+  clearAnonDraft,
   distanceSummary,
+  docForClaim,
   exitSitePlan,
   handleSiteClick,
   refreshOverlays,
@@ -27,6 +41,7 @@ import {
   removeSelected,
   schedulePersist,
   selectedFeature,
+  setClaimed,
   setLineSetback,
   site,
   startSitePlan,
@@ -43,6 +58,9 @@ import {
 } from "./offline";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
+
+let currentUser: Me | null = null;
+let siteMap: MapLibreMap | null = null;
 
 function money(value: number) {
   if (!value) return "—";
@@ -155,7 +173,8 @@ async function openSitePlan(map: MapLibreMap, props: ParcelProps, geom: Polygon 
   $("layers-panel").hidden = true;
   $("siteplan-panel").hidden = false;
   $("status").textContent = "Site plan · tap Place structure, then tap the lot";
-  const session = startSitePlan(map, props, geom);
+  const claimed = props.pin ? await planByPin(props.pin).catch(() => null) : null;
+  const session = startSitePlan(map, props, geom, claimed);
   fillZoneHint();
   syncSiteForm();
   renderDistances();
@@ -168,6 +187,79 @@ async function openSitePlan(map: MapLibreMap, props: ParcelProps, geom: Polygon 
   renderDistances();
 }
 
+function promptSignIn(message: string) {
+  $("auth-panel").hidden = false;
+  $("auth-status").textContent = message;
+  $("status").textContent = message;
+}
+
+function applyRemotePlan(plan: StoredPlan) {
+  if (site.planId !== plan.id && !(site.active && site.draftPin === plan.doc.pin)) return;
+  applyClaimedPlan(plan);
+  const map = siteMap;
+  if (site.active && map) {
+    refreshOverlays(map);
+    syncSiteForm();
+    renderDistances();
+  }
+}
+
+function bindSyncConflict() {
+  const queue: { resolve: (choice: ConflictChoice) => void }[] = [];
+
+  const show = () => {
+    const open = queue.length > 0;
+    $("sync-conflict").hidden = !open;
+    if (open) {
+      $("sync-conflict-msg").textContent = "Newer copy on server — Keep mine / Take server";
+      $("status").textContent = "Newer copy on server — Keep mine / Take server";
+    }
+  };
+
+  const choose = (choice: ConflictChoice) => {
+    queue.shift()?.resolve(choice);
+    show();
+  };
+
+  $("keep-mine").addEventListener("click", () => choose("keep"));
+  $("take-server").addEventListener("click", () => choose("take"));
+
+  return (_conflict: RevConflict) =>
+    new Promise<ConflictChoice>((resolve) => {
+      queue.push({ resolve });
+      show();
+    });
+}
+
+async function claimCurrentParcel(map: MapLibreMap) {
+  if (!currentUser) {
+    promptSignIn("Sign in to claim this parcel.");
+    return;
+  }
+  const pin = site.parcel?.pin || $("parcel-pin").textContent || "";
+  const found = pin ? parcelFeatureByPin(map, pin) : null;
+  if (!found) {
+    $("status").textContent = "Zoom in on the parcel, then try Claim this parcel again.";
+    return;
+  }
+  const props = { ...found.properties, ...site.parcel };
+  const geom = found.geometry;
+  $("status").textContent = "Claiming parcel…";
+  try {
+    const doc = docForClaim(props, geom);
+    const plan = await claimPlan({
+      pin: props.pin,
+      parcel: { props: toParcelSnapshot(props), geom },
+      doc,
+    });
+    clearAnonDraft(props.pin);
+    if (site.active && site.draftPin === props.pin) setClaimed(plan);
+    $("status").textContent = `Claimed PIN ${props.pin} · saved to this account`;
+  } catch (err) {
+    $("status").textContent = err instanceof Error ? err.message : "Could not claim parcel";
+  }
+}
+
 function bindSitePlan(map: MapLibreMap) {
   $("open-siteplan").addEventListener("click", () => {
     const pin = site.parcel?.pin || $("parcel-pin").textContent || "";
@@ -178,6 +270,10 @@ function bindSitePlan(map: MapLibreMap) {
     }
     const props = { ...found.properties, ...site.parcel };
     void openSitePlan(map, props, found.geometry);
+  });
+
+  $("claim-parcel").addEventListener("click", () => {
+    void claimCurrentParcel(map);
   });
 
   $("close-siteplan").addEventListener("click", () => {
@@ -476,6 +572,7 @@ function renderAuth(user: Me | null) {
 
 async function refreshSession() {
   const user = await me();
+  currentUser = user;
   renderAuth(user);
   if (sessionStorage.getItem("loginOk")) sessionStorage.removeItem("loginOk");
   if (sessionStorage.getItem("loginError")) {
@@ -485,6 +582,7 @@ async function refreshSession() {
       $("auth-status").textContent = "That sign-in link is invalid or already used.";
     }
   }
+  if (user) void pullPlans().catch(() => undefined);
 }
 
 function bindAuthChrome() {
@@ -557,6 +655,7 @@ function bindAuthChrome() {
 
   $("signout-btn").addEventListener("click", async () => {
     await logout();
+    currentUser = null;
     renderAuth(null);
   });
 }
@@ -564,8 +663,27 @@ function bindAuthChrome() {
 async function boot() {
   stripLoginQuery();
   const map = createMap($("map"));
+  siteMap = map;
+  setPlanStoreHooks({
+    onStatus(msg) {
+      $("status").textContent = msg;
+    },
+    onConflict: bindSyncConflict(),
+    onReplace: applyRemotePlan,
+    onAck: ackServerRev,
+    onUnauthorized() {
+      currentUser = null;
+      renderAuth(null);
+      promptSignIn("Sign in again to sync.");
+    },
+  });
   bindAuthChrome();
   void refreshSession();
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && currentUser) {
+      void pullPlans().catch(() => undefined);
+    }
+  });
   bindInstall();
   bindOffline();
   void refreshOfflineLabel();

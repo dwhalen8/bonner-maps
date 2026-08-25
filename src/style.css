@@ -261,6 +261,10 @@ dd { margin: 2px 0 0; }
 .btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
 .btn-row .ghost { width: auto; height: 38px; }
 .btn-row .ghost.active { outline: 2px solid var(--gold); }
+.parcel-actions .primary,
+.parcel-actions .ghost { width: auto; flex: 1; min-width: 140px; height: 44px; }
+.sheet.conflict { z-index: 6; bottom: calc(var(--safe-bottom) + 56px); max-height: none; }
+.sheet.conflict .primary { width: auto; flex: 1; }
 .measures { list-style: none; padding: 0; margin: 8px 0; font-size: 13px; }
 .measures li { padding: 3px 0; border-bottom: 1px solid var(--line); }
 .north {

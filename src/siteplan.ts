@@ -2,6 +2,7 @@ import type { GeoJSONSource, Map as MapLibreMap } from "maplibre-gl";
 import type { Feature, FeatureCollection, Point, Polygon, MultiPolygon, Position } from "geojson";
 import type { FeatureStatus, PlanDoc, PlanFeature } from "@shared/plan";
 import { PLAN_DOC_VERSION, toParcelSnapshot } from "@shared/plan";
+import { flushClaimedSync, saveClaimedLocal, type StoredPlan } from "./plan-store";
 import type { ParcelProps } from "./types";
 import {
   compass,
@@ -39,6 +40,8 @@ export interface SiteState {
   notes: string;
   /** Frozen at startSitePlan; persist key. Not the inspector parcel. */
   draftPin: string | null;
+  planId: string | null;
+  serverRev: number;
 }
 
 export interface SitePlanSession {
@@ -65,6 +68,8 @@ export const site: SiteState = {
   use: "Single-family dwelling",
   notes: "",
   draftPin: null,
+  planId: null,
+  serverRev: 0,
 };
 
 const empty = (): FeatureCollection => ({ type: "FeatureCollection", features: [] });
@@ -121,13 +126,11 @@ function loadDraft(pin: string): PlanDoc | null {
 let persistTimer = 0;
 let sessionParcel: ParcelProps | null = null;
 
-export function persistDraft() {
-  window.clearTimeout(persistTimer);
-  persistTimer = 0;
+function snapshotDoc(): PlanDoc | null {
   const pin = site.draftPin;
-  if (!pin || !site.geom || !sessionParcel) return;
+  if (!pin || !site.geom || !sessionParcel) return null;
   const now = new Date().toISOString();
-  const doc: PlanDoc = {
+  return {
     version: PLAN_DOC_VERSION,
     pin,
     title: site.use,
@@ -145,11 +148,85 @@ export function persistDraft() {
     checklist: [],
     clientEditedAt: now,
   };
+}
+
+export function persistDraft() {
+  window.clearTimeout(persistTimer);
+  persistTimer = 0;
+  const doc = snapshotDoc();
+  if (!doc) return;
+  if (site.planId) {
+    void saveClaimedLocal(site.planId, doc);
+    return;
+  }
   try {
-    localStorage.setItem(draftKey(pin), JSON.stringify(doc));
+    localStorage.setItem(draftKey(doc.pin), JSON.stringify(doc));
   } catch {
     // private mode / quota — keep working in memory
   }
+}
+
+export function clearAnonDraft(pin: string) {
+  try {
+    localStorage.removeItem(draftKey(pin));
+  } catch {
+    /* ignore */
+  }
+}
+
+export function docForClaim(props: ParcelProps, geom: Polygon | MultiPolygon): PlanDoc {
+  const pin = props.pin;
+  const now = new Date().toISOString();
+  const live = site.draftPin === pin ? snapshotDoc() : null;
+  const draft = live ?? loadDraft(pin);
+  return {
+    version: PLAN_DOC_VERSION,
+    pin,
+    title: draft?.title || draft?.use || props.addr || props.o1 || pin,
+    use: draft?.use || "Single-family dwelling",
+    notes: draft?.notes ?? "",
+    lineFt: typeof draft?.lineFt === "number" ? draft.lineFt : 25,
+    accessory: Boolean(draft?.accessory),
+    parcel: {
+      props: toParcelSnapshot(props),
+      geom,
+      snapshotAt: now,
+    },
+    features: Array.isArray(draft?.features) ? draft.features.filter(isDraftFeature) : [],
+    constraints: null,
+    checklist: Array.isArray(draft?.checklist) ? draft.checklist : [],
+    clientEditedAt: now,
+  };
+}
+
+export function applyClaimedPlan(plan: StoredPlan) {
+  const doc = plan.doc;
+  site.planId = plan.id;
+  site.serverRev = plan.serverRev;
+  site.use = typeof doc.use === "string" && doc.use ? doc.use : "Single-family dwelling";
+  site.notes = typeof doc.notes === "string" ? doc.notes : "";
+  site.lineFt = typeof doc.lineFt === "number" ? doc.lineFt : 25;
+  site.accessory = Boolean(doc.accessory);
+  site.features = Array.isArray(doc.features) ? doc.features.filter(isDraftFeature) : [];
+  if (doc.parcel?.geom) site.geom = doc.parcel.geom as Polygon | MultiPolygon;
+  const lastStruct = [...site.features].reverse().find((f) => f.kind === "structure");
+  site.selectedId = lastStruct?.id ?? site.features.at(-1)?.id ?? null;
+  const selected = site.features.find((f) => f.id === site.selectedId);
+  if (selected) site.status = selected.status;
+  if (selected?.kind === "structure") {
+    site.widthFt = selected.props.widthFt ?? 40;
+    site.lengthFt = selected.props.lengthFt ?? 60;
+    site.rotationDeg = selected.props.rotationDeg ?? 0;
+  }
+}
+
+export function ackServerRev(id: string, serverRev: number) {
+  if (site.planId === id) site.serverRev = serverRev;
+}
+
+export function setClaimed(plan: StoredPlan) {
+  site.planId = plan.id;
+  site.serverRev = plan.serverRev;
 }
 
 export function schedulePersist() {
@@ -157,7 +234,10 @@ export function schedulePersist() {
   persistTimer = window.setTimeout(() => persistDraft(), 400);
 }
 
-window.addEventListener("pagehide", () => persistDraft());
+window.addEventListener("pagehide", () => {
+  persistDraft();
+  flushClaimedSync();
+});
 
 function setSrc(map: MapLibreMap, id: string, data: FeatureCollection) {
   const src = map.getSource(id) as GeoJSONSource | undefined;
@@ -322,6 +402,7 @@ export function startSitePlan(
   map: MapLibreMap,
   parcel: ParcelProps,
   geom: Polygon | MultiPolygon,
+  claimed?: StoredPlan | null,
 ): SitePlanSession {
   persistDraft();
 
@@ -335,8 +416,10 @@ export function startSitePlan(
   site.status = "proposed";
   site.zoning = null;
   site.rule = ruleForZone(null);
+  site.planId = claimed?.id ?? null;
+  site.serverRev = claimed?.serverRev ?? 0;
 
-  const draft = parcel.pin ? loadDraft(parcel.pin) : null;
+  const draft = claimed?.doc ?? (parcel.pin ? loadDraft(parcel.pin) : null);
   if (draft) {
     site.use = typeof draft.use === "string" && draft.use ? draft.use : "Single-family dwelling";
     site.notes = typeof draft.notes === "string" ? draft.notes : "";
@@ -400,6 +483,8 @@ export function exitSitePlan(map: MapLibreMap) {
   persistDraft();
   site.active = false;
   site.draftPin = null;
+  site.planId = null;
+  site.serverRev = 0;
   sessionParcel = null;
   site.parcel = null;
   site.geom = null;
