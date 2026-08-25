@@ -24,6 +24,7 @@ import {
   finishDrawing,
   handleSiteClick,
   isDrawKind,
+  parseUseClass,
   shouldPreventDrawZoom,
   refreshOverlays,
   refreshSiteZoning,
@@ -32,11 +33,13 @@ import {
   selectedFeature,
   setLineSetback,
   setPlaceMode,
+  setView,
   site,
   startSitePlan,
   updateSelected,
   wellSepticAdvisory,
   encroachmentAdvisory,
+  type PlanView,
   type SiteKind,
 } from "./siteplan";
 import { formatFeet } from "./geo";
@@ -143,6 +146,28 @@ function fillPrintBlock() {
   $("print-notes").textContent = site.notes;
 }
 
+function syncViewToggle() {
+  const isPlan = site.view === "plan";
+  $("view-plan").classList.toggle("active", isPlan);
+  $("view-packet").classList.toggle("active", !isPlan);
+  $("view-plan").setAttribute("aria-pressed", String(isPlan));
+  $("view-packet").setAttribute("aria-pressed", String(!isPlan));
+  $("view-hint").textContent = isPlan
+    ? "Plan is the working map. Packet hides use areas unless Show on packet is checked."
+    : "Packet preview — use areas hidden unless Show on packet is checked.";
+}
+
+function syncUseAreaFields() {
+  const selected = selectedFeature();
+  const placing = site.placeMode === "use_area";
+  const editing = !site.placeMode && selected?.kind === "use_area";
+  $("use-area-fields").hidden = !placing && !editing;
+  $("site-on-packet-wrap").hidden = !editing;
+  if (editing) site.useClass = parseUseClass(selected.props.useClass);
+  $<HTMLSelectElement>("site-use-class").value = site.useClass;
+  $<HTMLInputElement>("site-on-packet").checked = editing ? selected.onPacket : false;
+}
+
 function syncSiteForm() {
   $<HTMLInputElement>("site-use").value = site.use;
   $<HTMLTextAreaElement>("site-notes").value = site.notes;
@@ -158,6 +183,8 @@ function syncSiteForm() {
   $<HTMLInputElement>("site-width").value = String(site.widthFt);
   $<HTMLInputElement>("site-length").value = String(site.lengthFt);
   $<HTMLInputElement>("site-rot").value = String(site.rotationDeg);
+  syncViewToggle();
+  syncUseAreaFields();
 }
 
 function fillZoneHint() {
@@ -215,6 +242,13 @@ function bindSitePlan(map: MapLibreMap) {
     highlightParcel(map, null);
   });
 
+  const applyView = (view: PlanView) => {
+    setView(map, view);
+    syncViewToggle();
+  };
+  $("view-plan").addEventListener("click", () => applyView("plan"));
+  $("view-packet").addEventListener("click", () => applyView("packet"));
+
   const setback = $<HTMLInputElement>("site-setback");
   const accessory = $<HTMLInputElement>("site-accessory");
   const width = $<HTMLInputElement>("site-width");
@@ -269,14 +303,30 @@ function bindSitePlan(map: MapLibreMap) {
     schedulePersist();
   });
 
+  $("site-use-class").addEventListener("change", (event) => {
+    site.useClass = parseUseClass((event.target as HTMLSelectElement).value);
+    if (selectedFeature()?.kind === "use_area") {
+      updateSelected({ useClass: site.useClass });
+      refreshOverlays(map);
+      syncUseAreaFields();
+    }
+  });
+  $("site-on-packet").addEventListener("change", (event) => {
+    if (selectedFeature()?.kind !== "use_area") return;
+    updateSelected({ onPacket: (event.target as HTMLInputElement).checked });
+    refreshOverlays(map);
+  });
+
   const arm = (id: string, mode: SiteKind, prompt: string) => {
     $(id).addEventListener("click", () => {
+      if (mode === "use_area" && site.view === "packet") applyView("plan");
       setPlaceMode(map, mode);
       for (const btn of document.querySelectorAll(".btn-row .ghost")) {
         btn.classList.toggle("active", btn.id === id);
       }
       $("status").textContent = prompt;
       syncDrawUi();
+      syncUseAreaFields();
     });
   };
   arm("place-structure", "structure", "Tap the lot to place a structure");
@@ -289,6 +339,7 @@ function bindSitePlan(map: MapLibreMap) {
   );
   arm("place-leach", "leach", "Tap leach field vertices on the lot. Finish or double-tap to close.");
   arm("place-easement", "easement", "Tap easement vertices. Finish or double-tap to complete.");
+  arm("place-use-area", "use_area", "Tap use-area vertices on the lot. Finish or double-tap to close.");
 
   $("finish-draw").addEventListener("click", () => {
     const kind = site.placeMode;
@@ -317,7 +368,8 @@ function bindSitePlan(map: MapLibreMap) {
   window.addEventListener("keydown", (event) => {
     if (!site.active) return;
     if (event.key === "Delete" || event.key === "Backspace") {
-      if ((event.target as HTMLElement).tagName === "INPUT" || (event.target as HTMLElement).tagName === "TEXTAREA") {
+      const tag = (event.target as HTMLElement).tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") {
         return;
       }
       removeSelected();
@@ -534,7 +586,11 @@ async function boot() {
         if (result) {
           if (result === "rejected") {
             $("status").textContent =
-              placing === "leach" ? "Stay on the lot for the leach field" : "Stay on the lot";
+              placing === "leach"
+                ? "Stay on the lot for the leach field"
+                : placing === "use_area"
+                  ? "Stay on the lot for the use area"
+                  : "Stay on the lot";
             return;
           }
           if (!site.placeMode) clearPlaceButtons();

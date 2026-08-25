@@ -31,6 +31,14 @@ export type FeatureKind =
   | "note"
   | "front_door";
 
+export type UseAreaClass =
+  | "garden"
+  | "pasture"
+  | "timber"
+  | "shop_yard"
+  | "orchard"
+  | "other";
+
 export interface PlanFeature {
   id: string;
   kind: FeatureKind;
@@ -43,7 +51,7 @@ export interface PlanFeature {
     lengthFt?: number;
     rotationDeg?: number;
     eaveFt?: number;
-    useClass?: string;
+    useClass?: UseAreaClass;
     source?: "user" | "county" | "fema" | "nwi" | "nhd";
     notes?: string;
   };

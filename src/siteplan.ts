@@ -11,7 +11,7 @@ import type {
 } from "geojson";
 import { lineString, point } from "@turf/helpers";
 import nearestPointOnLine from "@turf/nearest-point-on-line";
-import type { FeatureKind, FeatureStatus, PlanDoc, PlanFeature } from "@shared/plan";
+import type { FeatureKind, FeatureStatus, PlanDoc, PlanFeature, UseAreaClass } from "@shared/plan";
 import { PLAN_DOC_VERSION, toParcelSnapshot } from "@shared/plan";
 import type { ParcelProps } from "./types";
 import {
@@ -27,12 +27,36 @@ import {
   rectanglePolygon,
 } from "./geo";
 import { fetchZoningAt, ruleForZone, type SetbackRule } from "./setbacks";
-import { setDoubleClickZoom } from "./map";
+import { addHatchPatterns, setDoubleClickZoom, USE_AREA_HATCH_IDS } from "./map";
 
 export type PointKind = "structure" | "well" | "septic";
-export type DrawKind = "driveway" | "leach" | "easement";
+export type DrawKind = "driveway" | "leach" | "easement" | "use_area";
 export type SiteKind = PointKind | DrawKind;
 export type PlaceMode = null | SiteKind;
+export type PlanView = "plan" | "packet";
+export type { UseAreaClass };
+
+export const USE_AREA_CLASSES: UseAreaClass[] = [
+  "garden",
+  "pasture",
+  "timber",
+  "shop_yard",
+  "orchard",
+  "other",
+];
+
+export const USE_AREA_LABELS: Record<UseAreaClass, string> = {
+  garden: "Garden",
+  pasture: "Pasture",
+  timber: "Timber",
+  shop_yard: "Shop yard",
+  orchard: "Orchard",
+  other: "Use area",
+};
+
+export function parseUseClass(value: string | undefined | null): UseAreaClass {
+  return USE_AREA_CLASSES.includes(value as UseAreaClass) ? (value as UseAreaClass) : "other";
+}
 
 /** Panhandle Health commonly wants 100 ft well→septic. Advisory only. */
 export const WELL_SEPTIC_ADVISORY_FT = 100;
@@ -58,6 +82,9 @@ export interface SiteState {
   rotationDeg: number;
   use: string;
   notes: string;
+  /** Plan = working map; Packet = BLP preview. Filters overlays only — not a second document. */
+  view: PlanView;
+  useClass: UseAreaClass;
   /** Frozen at startSitePlan; persist key. Not the inspector parcel. */
   draftPin: string | null;
 }
@@ -86,6 +113,8 @@ export const site: SiteState = {
   rotationDeg: 0,
   use: "Single-family dwelling",
   notes: "",
+  view: "plan",
+  useClass: "garden",
   draftPin: null,
 };
 
@@ -100,6 +129,7 @@ const SITE_SOURCES = [
   "site-driveway",
   "site-leach",
   "site-easement",
+  "site-use-area",
   "site-draw",
 ] as const;
 
@@ -114,7 +144,7 @@ let zoomHoldTimer = 0;
 let zoomHoldUntil = 0;
 
 export function isDrawKind(kind: string | null | undefined): kind is DrawKind {
-  return kind === "driveway" || kind === "leach" || kind === "easement";
+  return kind === "driveway" || kind === "leach" || kind === "easement" || kind === "use_area";
 }
 
 export function isPointKind(kind: string | null | undefined): kind is PointKind {
@@ -143,7 +173,9 @@ export function drawPrompt() {
       ? "Tap driveway vertices. May start off the lot."
       : kind === "leach"
         ? "Tap leach field vertices on the lot."
-        : "Tap easement vertices.";
+        : kind === "use_area"
+          ? "Tap use-area vertices on the lot."
+          : "Tap easement vertices.";
   if (n === 0) return `${start} Finish or double-tap to complete.`;
   if (n < min) return `${n} vertex${n === 1 ? "" : "es"} · need ${min} to finish`;
   return `${n} vertices · Finish or double-tap to complete`;
@@ -157,7 +189,7 @@ function featureCenter(feature: PlanFeature): Position | null {
   return feature.geom.type === "Point" ? feature.geom.coordinates : null;
 }
 
-function defaultLabel(kind: FeatureKind, status: FeatureStatus) {
+function defaultLabel(kind: FeatureKind, status: FeatureStatus, useClass?: string) {
   const existing = status === "existing";
   switch (kind) {
     case "structure":
@@ -172,6 +204,10 @@ function defaultLabel(kind: FeatureKind, status: FeatureStatus) {
       return existing ? "Existing leach field" : "Leach field";
     case "easement":
       return existing ? "Existing easement" : "Easement";
+    case "use_area": {
+      const name = USE_AREA_LABELS[parseUseClass(useClass)];
+      return existing ? `Existing ${name.toLowerCase()}` : name;
+    }
     default:
       return kind;
   }
@@ -298,13 +334,17 @@ function loadDraft(pin: string): PlanDoc | null {
     if (!parsed || parsed.pin !== pin) return null;
     if (parsed.version != null && parsed.version !== PLAN_DOC_VERSION) return null;
     if (!Array.isArray(parsed.features)) parsed.features = [];
-    parsed.features = parsed.features.filter(isDraftFeature).map((f) => ({
-      ...f,
-      status: f.status === "existing" ? "existing" : "proposed",
-      label: f.label || f.kind,
-      onPacket: f.onPacket !== false,
-      props: f.props ?? {},
-    }));
+    parsed.features = parsed.features.filter(isDraftFeature).map((f) => {
+      const props = { ...(f.props ?? {}) };
+      if (f.kind === "use_area") props.useClass = parseUseClass(props.useClass);
+      return {
+        ...f,
+        status: f.status === "existing" ? "existing" : "proposed",
+        label: f.label || defaultLabel(f.kind, f.status === "existing" ? "existing" : "proposed", props.useClass),
+        onPacket: f.kind === "use_area" ? f.onPacket === true : f.onPacket !== false,
+        props,
+      };
+    });
     return parsed;
   } catch {
     return null;
@@ -358,6 +398,7 @@ function setSrc(map: MapLibreMap, id: string, data: FeatureCollection) {
 }
 
 export function addSiteLayers(map: MapLibreMap) {
+  addHatchPatterns(map);
   for (const id of SITE_SOURCES) {
     if (map.getSource(id)) continue;
     map.addSource(id, { type: "geojson", data: empty() });
@@ -563,6 +604,98 @@ export function addSiteLayers(map: MapLibreMap) {
     });
   }
 
+  if (!map.getLayer("site-use-area-fill")) {
+    const under = map.getLayer("site-structure-fill") ? "site-structure-fill" : undefined;
+    map.addLayer(
+      {
+        id: "site-use-area-fill",
+        type: "fill",
+        source: "site-use-area",
+        paint: {
+          "fill-color": [
+            "match",
+            ["get", "useClass"],
+            "garden",
+            "#52b788",
+            "pasture",
+            "#a7c957",
+            "timber",
+            "#2d6a4f",
+            "shop_yard",
+            "#8d6e63",
+            "orchard",
+            "#e76f51",
+            "#d4b46a",
+          ],
+          "fill-opacity": 0.22,
+        },
+      },
+      under,
+    );
+    map.addLayer(
+      {
+        id: "site-use-area-hatch",
+        type: "fill",
+        source: "site-use-area",
+        paint: {
+          "fill-pattern": [
+            "match",
+            ["get", "useClass"],
+            "garden",
+            USE_AREA_HATCH_IDS.garden,
+            "pasture",
+            USE_AREA_HATCH_IDS.pasture,
+            "timber",
+            USE_AREA_HATCH_IDS.timber,
+            "shop_yard",
+            USE_AREA_HATCH_IDS.shop_yard,
+            "orchard",
+            USE_AREA_HATCH_IDS.orchard,
+            USE_AREA_HATCH_IDS.other,
+          ],
+        },
+      },
+      under,
+    );
+    map.addLayer(
+      {
+        id: "site-use-area-line",
+        type: "line",
+        source: "site-use-area",
+        paint: {
+          "line-color": [
+            "match",
+            ["get", "useClass"],
+            "garden",
+            "#2d6a4f",
+            "pasture",
+            "#6a994e",
+            "timber",
+            "#1b4332",
+            "shop_yard",
+            "#6c584c",
+            "orchard",
+            "#bc4749",
+            "#b08968",
+          ],
+          "line-width": ["case", ["boolean", ["get", "selected"], false], 2.8, 1.6],
+        },
+      },
+      under,
+    );
+    map.addLayer({
+      id: "site-use-area-label",
+      type: "symbol",
+      source: "site-use-area",
+      layout: {
+        "text-field": ["get", "label"],
+        "text-size": 12,
+        "text-font": ["Noto Sans Regular"],
+      },
+      paint: { "text-color": "#111", "text-halo-color": "#fff", "text-halo-width": 1.4 },
+    });
+  }
+
   if (!map.getLayer("site-draw-fill")) {
     map.addLayer({
       id: "site-draw-fill",
@@ -621,6 +754,7 @@ function resetFormDefaults() {
   site.lengthFt = 60;
   site.rotationDeg = 0;
   site.status = "proposed";
+  site.useClass = "garden";
   site.zoning = null;
   site.rule = ruleForZone(null);
 }
@@ -645,6 +779,8 @@ export function startSitePlan(
   clearZoomHold();
   setDoubleClickZoom(map, true);
   site.status = "proposed";
+  site.view = "plan";
+  site.useClass = "garden";
   site.zoning = null;
   site.rule = ruleForZone(null);
 
@@ -668,6 +804,7 @@ export function startSitePlan(
       site.lengthFt = 60;
       site.rotationDeg = 0;
     }
+    if (selected?.kind === "use_area") site.useClass = parseUseClass(selected.props.useClass);
   } else {
     site.features = [];
     resetFormDefaults();
@@ -717,6 +854,7 @@ export function exitSitePlan(map: MapLibreMap) {
   site.geom = null;
   site.placeMode = null;
   site.drawVertices = [];
+  site.view = "plan";
   lastTapAt = 0;
   lastTapPos = null;
   clearZoomHold();
@@ -766,7 +904,7 @@ export function addFeature(kind: PointKind, center: Position, extras: Partial<Pl
 }
 
 export function updateSelected(
-  partial: Partial<PlanFeature["props"]> & { status?: FeatureStatus; label?: string },
+  partial: Partial<PlanFeature["props"]> & { status?: FeatureStatus; label?: string; onPacket?: boolean },
 ) {
   const feature = selectedFeature();
   if (!feature) return;
@@ -774,15 +912,31 @@ export function updateSelected(
   if (partial.lengthFt != null) feature.props.lengthFt = partial.lengthFt;
   if (partial.rotationDeg != null) feature.props.rotationDeg = partial.rotationDeg;
   if (partial.eaveFt != null) feature.props.eaveFt = partial.eaveFt;
-  if (partial.useClass != null) feature.props.useClass = partial.useClass;
+  if (partial.useClass != null) {
+    feature.props.useClass = parseUseClass(partial.useClass);
+    if (feature.kind === "use_area" && !partial.label) {
+      feature.label = defaultLabel(feature.kind, feature.status, feature.props.useClass);
+    }
+  }
   if (partial.source != null) feature.props.source = partial.source;
   if (partial.notes != null) feature.props.notes = partial.notes;
+  if (partial.onPacket != null) feature.onPacket = partial.onPacket;
   if (partial.status) {
     feature.status = partial.status;
-    feature.label = defaultLabel(feature.kind, feature.status);
+    feature.label = defaultLabel(feature.kind, feature.status, feature.props.useClass);
   }
   if (partial.label) feature.label = partial.label;
   schedulePersist();
+}
+
+export function setView(map: MapLibreMap, view: PlanView) {
+  site.view = view;
+  refreshOverlays(map);
+}
+
+function featureVisible(feature: PlanFeature) {
+  if (site.view === "packet" && feature.kind === "use_area" && !feature.onPacket) return false;
+  return true;
 }
 
 export function removeSelected() {
@@ -863,14 +1017,15 @@ export function finishDrawing(map: MapLibreMap): PlanFeature | null {
       ? { type: "LineString", coordinates: verts }
       : { type: "Polygon", coordinates: [closedRing(verts)] };
 
+  const useClass = kind === "use_area" ? site.useClass : undefined;
   const feature: PlanFeature = {
     id: `${kind}-${Date.now()}`,
     kind,
     status,
-    label: defaultLabel(kind, status),
+    label: defaultLabel(kind, status, useClass),
     geom,
-    onPacket: true,
-    props: { source: "user" },
+    onPacket: kind !== "use_area",
+    props: { source: "user", ...(useClass ? { useClass } : {}) },
   };
   site.features.push(feature);
   site.selectedId = feature.id;
@@ -932,6 +1087,7 @@ function mapProps(feature: PlanFeature) {
     status: feature.status,
     selected: feature.id === site.selectedId,
     label: feature.label,
+    useClass: parseUseClass(feature.props.useClass),
   };
 }
 
@@ -1057,6 +1213,14 @@ export function refreshOverlays(map: MapLibreMap) {
     }),
   });
 
+  setSrc(map, "site-use-area", {
+    type: "FeatureCollection",
+    features: site.features.flatMap((f): Feature<Polygon>[] => {
+      if (f.kind !== "use_area" || f.geom.type !== "Polygon" || !featureVisible(f)) return [];
+      return [{ type: "Feature", properties: mapProps(f), geometry: f.geom }];
+    }),
+  });
+
   refreshDrawPreview(map);
 }
 
@@ -1068,11 +1232,11 @@ function pickFeatureAt(lngLat: Position): PlanFeature | null {
       if (poly && pointInParcel(lngLat, poly.geometry)) return feature;
     }
     if (
-      (feature.kind === "leach" || feature.kind === "easement") &&
+      (feature.kind === "leach" || feature.kind === "easement" || feature.kind === "use_area") &&
       feature.geom.type === "Polygon" &&
       pointInParcel(lngLat, feature.geom)
     ) {
-      return feature;
+      if (featureVisible(feature)) return feature;
     }
   }
   let best: PlanFeature | null = null;
@@ -1112,6 +1276,7 @@ export function handleSiteClick(map: MapLibreMap, lngLat: Position): SiteClickRe
   if (!hit) return false;
   site.selectedId = hit.id;
   site.status = hit.status;
+  if (hit.kind === "use_area") site.useClass = parseUseClass(hit.props.useClass);
   refreshOverlays(map);
   return "selected";
 }

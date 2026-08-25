@@ -213,7 +213,8 @@ dd { margin: 2px 0 0; }
 .sheet .row label, .sheet label { font-size: 12px; color: var(--muted); }
 .sheet input[type="text"],
 .sheet input[type="number"],
-.sheet textarea {
+.sheet textarea,
+.sheet select {
   width: 100%;
   margin-top: 4px;
   padding: 8px;
@@ -222,6 +223,25 @@ dd { margin: 2px 0 0; }
   background: #0e1a14;
   color: var(--ink);
   font: inherit;
+}
+.view-toggle {
+  display: flex;
+  margin: 8px 0 4px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.view-toggle .ghost {
+  flex: 1;
+  height: 36px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+.view-toggle .ghost.active {
+  background: #163524;
+  outline: none;
+  color: #d8f3dc;
 }
 .sheet .check { display: flex; align-items: center; gap: 8px; margin-top: 22px; }
 .sheet .row .check { white-space: nowrap; }

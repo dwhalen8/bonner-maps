@@ -215,6 +215,86 @@ export function setLayerVisible(map: maplibregl.Map, id: string, on: boolean) {
   map.setLayoutProperty(id, "visibility", on ? "visible" : "none");
 }
 
+/** Same ids as `fill-pattern` on `site-use-area-hatch`. */
+export const USE_AREA_HATCH_IDS = {
+  garden: "hatch-garden",
+  pasture: "hatch-pasture",
+  timber: "hatch-timber",
+  shop_yard: "hatch-shop-yard",
+  orchard: "hatch-orchard",
+  other: "hatch-other",
+} as const;
+
+const HATCH_SIZE = 32;
+
+type HatchSpec = {
+  id: string;
+  color: string;
+  angle: 0 | 45 | 90 | 135;
+  spacing: number;
+  cross?: boolean;
+};
+
+const HATCH_SPECS: HatchSpec[] = [
+  { id: USE_AREA_HATCH_IDS.garden, color: "#2d6a4f", angle: 45, spacing: 8 },
+  { id: USE_AREA_HATCH_IDS.pasture, color: "#6a994e", angle: 0, spacing: 8 },
+  { id: USE_AREA_HATCH_IDS.timber, color: "#1b4332", angle: 90, spacing: 8 },
+  { id: USE_AREA_HATCH_IDS.shop_yard, color: "#6c584c", angle: 45, spacing: 8, cross: true },
+  { id: USE_AREA_HATCH_IDS.orchard, color: "#bc4749", angle: 135, spacing: 8 },
+  { id: USE_AREA_HATCH_IDS.other, color: "#b08968", angle: 45, spacing: 10 },
+];
+
+function makeHatchImage(spec: HatchSpec): ImageData {
+  const size = HATCH_SIZE;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return new ImageData(size, size);
+  ctx.clearRect(0, 0, size, size);
+  ctx.strokeStyle = spec.color;
+  ctx.lineWidth = 1.75;
+  ctx.lineCap = "butt";
+
+  const stroke = (angle: 0 | 45 | 90 | 135) => {
+    ctx.beginPath();
+    if (angle === 0) {
+      for (let y = spec.spacing / 2; y < size; y += spec.spacing) {
+        ctx.moveTo(0, y);
+        ctx.lineTo(size, y);
+      }
+    } else if (angle === 90) {
+      for (let x = spec.spacing / 2; x < size; x += spec.spacing) {
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, size);
+      }
+    } else if (angle === 45) {
+      for (let i = -size; i <= size; i += spec.spacing) {
+        ctx.moveTo(i, size);
+        ctx.lineTo(i + size, 0);
+      }
+    } else {
+      for (let i = -size; i <= size; i += spec.spacing) {
+        ctx.moveTo(i, 0);
+        ctx.lineTo(i + size, size);
+      }
+    }
+    ctx.stroke();
+  };
+
+  stroke(spec.angle);
+  if (spec.cross) stroke(((spec.angle + 90) % 180) as 0 | 45 | 90 | 135);
+  return ctx.getImageData(0, 0, size, size);
+}
+
+/** Transparent tiled hatches for use-area fills. Idempotent. */
+export function addHatchPatterns(map: maplibregl.Map) {
+  for (const spec of HATCH_SPECS) {
+    if (map.hasImage(spec.id)) continue;
+    map.addImage(spec.id, makeHatchImage(spec));
+  }
+}
+
 /** Vertex-draw uses double-tap to finish; disable the map's zoom while drawing. */
 export function setDoubleClickZoom(map: maplibregl.Map, on: boolean) {
   if (on) map.doubleClickZoom.enable();

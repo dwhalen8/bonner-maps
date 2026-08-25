@@ -99,6 +99,11 @@
       <section id="siteplan-panel" class="sheet siteplan no-print" hidden>
         <button id="close-siteplan" class="icon-x" aria-label="Close site plan">×</button>
         <h2>BLP site map</h2>
+        <div class="view-toggle" role="group" aria-label="Plan or packet view">
+          <button id="view-plan" type="button" class="ghost active" aria-pressed="true">Plan</button>
+          <button id="view-packet" type="button" class="ghost" aria-pressed="false">Packet</button>
+        </div>
+        <p class="hint" id="view-hint">Plan is the working map. Packet hides use areas unless Show on packet is checked.</p>
         <p class="hint" id="site-zone">Select a parcel, then place the proposed structure.</p>
         <p class="hint">Drafts save on this device per parcel. Tap a mark to select it. Driveway may start off the lot.</p>
         <label>Proposed use
@@ -133,7 +138,23 @@
           <button id="place-driveway" type="button" class="ghost">Driveway</button>
           <button id="place-leach" type="button" class="ghost">Leach field</button>
           <button id="place-easement" type="button" class="ghost">Easement</button>
+          <button id="place-use-area" type="button" class="ghost">Use area</button>
           <button id="finish-draw" type="button" class="ghost" disabled>Finish drawing</button>
+        </div>
+        <div id="use-area-fields" class="row" hidden>
+          <label>Use class
+            <select id="site-use-class">
+              <option value="garden">Garden</option>
+              <option value="pasture">Pasture</option>
+              <option value="timber">Timber</option>
+              <option value="shop_yard">Shop yard</option>
+              <option value="orchard">Orchard</option>
+              <option value="other">Other</option>
+            </select>
+          </label>
+          <label class="check" id="site-on-packet-wrap">
+            <input id="site-on-packet" type="checkbox" /> Show on packet
+          </label>
         </div>
         <ul id="site-distances" class="measures"></ul>
         <label>Notes
