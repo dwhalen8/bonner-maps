@@ -57,6 +57,19 @@
         <label><input type="checkbox" id="layer-public" checked /> Public land fill</label>
         <label><input type="checkbox" id="layer-labels" checked /> Owner labels</label>
         <label><input type="checkbox" id="layer-county" checked /> County outline</label>
+        <fieldset id="constraint-layers" hidden>
+          <legend>Site constraints</legend>
+          <label><input type="checkbox" id="layer-flood" checked /> Flood</label>
+          <label><input type="checkbox" id="layer-wetlands" checked /> Wetlands</label>
+          <label><input type="checkbox" id="layer-roads" checked /> Roads</label>
+          <label><input type="checkbox" id="layer-row" checked /> ROW</label>
+          <label><input type="checkbox" id="layer-shoreline" checked /> Shoreline</label>
+          <label><input type="checkbox" id="layer-water" checked /> Water</label>
+          <p class="hint">
+            GIS ROW is not easements of record. Shoreline 40/75 ft from NHD; wetland 40 ft
+            is advisory — verify with Planning. Overlays are session-only.
+          </p>
+        </fieldset>
         <ul class="legend">
           <li><i class="swatch private"></i> Private</li>
           <li><i class="swatch usfs"></i> Federal / USFS</li>

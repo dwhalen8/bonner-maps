@@ -6,6 +6,8 @@ import { LAND_LABELS } from "./types";
 import {
   addDataLayers,
   addLocationDot,
+  applyConstraintLayers,
+  CONSTRAINT_TOGGLES,
   createMap,
   highlightParcel,
   parcelFeatureByPin,
@@ -16,6 +18,7 @@ import {
   updateLocation,
   type BasemapId,
 } from "./map";
+import { fetchConstraintOverlays, incompleteConstraintMessage } from "./constraints";
 import {
   distanceSummary,
   exitSitePlan,
@@ -59,6 +62,7 @@ function acres(value: number) {
 function showParcel(map: MapLibreMap, props: ParcelProps) {
   if (site.active) {
     $("siteplan-panel").hidden = true;
+    $("constraint-layers").hidden = true;
     exitSitePlan(map);
     syncSiteForm();
   }
@@ -148,15 +152,41 @@ function fillZoneHint() {
     : `Looking up zoning · using ${site.lineFt} ft until county GIS answers.`;
 }
 
+async function loadSiteConstraints(map: MapLibreMap, sessionPin: string, geom: Polygon | MultiPolygon) {
+  const status = $("status");
+  const loading = "Site plan · loading constraint overlays…";
+  const idle = "Site plan · tap Place structure, then tap the lot";
+  if (!status.textContent || status.textContent.startsWith("Site plan")) status.textContent = loading;
+  try {
+    const clip = await fetchConstraintOverlays(geom, site.zoning);
+    if (!site.active || site.draftPin !== sessionPin || !clip) return;
+    site.constraints = clip;
+    if (site.zoning) clip.zoning = { zonedesc: site.zoning, fetchedAt: clip.zoning.fetchedAt };
+    applyConstraintLayers(map, clip);
+    applyConstraintToggles(map);
+    const incomplete = incompleteConstraintMessage(clip);
+    if (incomplete) {
+      status.textContent = incomplete;
+    } else if (status.textContent === loading) {
+      status.textContent = idle;
+    }
+  } catch {
+    if (!site.active || site.draftPin !== sessionPin) return;
+    status.textContent = "Constraint overlays incomplete · site plan still usable";
+  }
+}
+
 async function openSitePlan(map: MapLibreMap, props: ParcelProps, geom: Polygon | MultiPolygon) {
   $("parcel-card").hidden = true;
   $("layers-panel").hidden = true;
   $("siteplan-panel").hidden = false;
+  $("constraint-layers").hidden = false;
   $("status").textContent = "Site plan · tap Place structure, then tap the lot";
   const session = startSitePlan(map, props, geom);
   fillZoneHint();
   syncSiteForm();
   renderDistances();
+  void loadSiteConstraints(map, session.pin, geom);
   await refreshSiteZoning(map, session);
   if (!site.active || site.draftPin !== session.pin) return;
   $("site-zone").textContent = site.zoning
@@ -180,6 +210,7 @@ function bindSitePlan(map: MapLibreMap) {
 
   $("close-siteplan").addEventListener("click", () => {
     $("siteplan-panel").hidden = true;
+    $("constraint-layers").hidden = true;
     exitSitePlan(map);
     syncSiteForm();
     highlightParcel(map, null);
@@ -330,6 +361,14 @@ function bindSearch(map: MapLibreMap) {
   });
 }
 
+function applyConstraintToggles(map: MapLibreMap) {
+  for (const [key, layerIds] of Object.entries(CONSTRAINT_TOGGLES)) {
+    const input = document.getElementById(`layer-${key}`) as HTMLInputElement | null;
+    const on = input?.checked ?? true;
+    for (const id of layerIds) setLayerVisible(map, id, on);
+  }
+}
+
 function bindLayers(map: MapLibreMap) {
   const panel = $("layers-panel");
   $("layers-btn").addEventListener("click", () => {
@@ -349,6 +388,12 @@ function bindLayers(map: MapLibreMap) {
   $("layer-county").addEventListener("change", (event) => {
     setLayerVisible(map, "county-outline", (event.target as HTMLInputElement).checked);
   });
+  for (const [key, layerIds] of Object.entries(CONSTRAINT_TOGGLES)) {
+    $(`layer-${key}`).addEventListener("change", (event) => {
+      const on = (event.target as HTMLInputElement).checked;
+      for (const id of layerIds) setLayerVisible(map, id, on);
+    });
+  }
   for (const radio of document.querySelectorAll<HTMLInputElement>('input[name="basemap"]')) {
     radio.addEventListener("change", () => {
       if (radio.checked) setBasemap(map, radio.value as BasemapId);

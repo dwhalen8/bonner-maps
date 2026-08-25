@@ -16,6 +16,8 @@ import {
   rectanglePolygon,
 } from "./geo";
 import { fetchZoningAt, ruleForZone, type SetbackRule } from "./setbacks";
+import { cancelConstraintOverlays, type ConstraintClip } from "./constraints";
+import { addConstraintLayers, clearConstraintLayers } from "./map";
 
 export type SiteKind = "structure" | "well" | "septic";
 export type PlaceMode = null | SiteKind;
@@ -39,6 +41,8 @@ export interface SiteState {
   notes: string;
   /** Frozen at startSitePlan; persist key. Not the inspector parcel. */
   draftPin: string | null;
+  /** RAM-only GIS clips. Never written to localStorage. */
+  constraints: ConstraintClip | null;
 }
 
 export interface SitePlanSession {
@@ -65,6 +69,7 @@ export const site: SiteState = {
   use: "Single-family dwelling",
   notes: "",
   draftPin: null,
+  constraints: null,
 };
 
 const empty = (): FeatureCollection => ({ type: "FeatureCollection", features: [] });
@@ -141,7 +146,7 @@ export function persistDraft() {
       snapshotAt: now,
     },
     features: site.features,
-    constraints: null,
+    constraints: null, // clips stay in RAM; localStorage is quota-safe
     checklist: [],
     clientEditedAt: now,
   };
@@ -335,6 +340,8 @@ export function startSitePlan(
   site.status = "proposed";
   site.zoning = null;
   site.rule = ruleForZone(null);
+  site.constraints = null;
+  cancelConstraintOverlays();
 
   const draft = parcel.pin ? loadDraft(parcel.pin) : null;
   if (draft) {
@@ -362,6 +369,8 @@ export function startSitePlan(
   }
 
   addSiteLayers(map);
+  addConstraintLayers(map);
+  clearConstraintLayers(map);
   for (const id of ["parcels-line", "parcels-fill-private", "parcels-fill-public", "parcels-label", "county-outline"]) {
     if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", "none");
   }
@@ -390,6 +399,9 @@ export async function refreshSiteZoning(map: MapLibreMap, session: SitePlanSessi
   if (!site.active || site.draftPin !== session.pin) return;
   site.zoning = zoning;
   site.rule = ruleForZone(site.zoning);
+  if (site.constraints) {
+    site.constraints.zoning = { zonedesc: zoning, fetchedAt: new Date().toISOString() };
+  }
   if (!session.hadDraft && !site.accessory && site.lineFt === session.lineFtAtStart) {
     site.lineFt = site.rule.lineFt;
   }
@@ -398,6 +410,7 @@ export async function refreshSiteZoning(map: MapLibreMap, session: SitePlanSessi
 
 export function exitSitePlan(map: MapLibreMap) {
   persistDraft();
+  cancelConstraintOverlays();
   site.active = false;
   site.draftPin = null;
   sessionParcel = null;
@@ -406,7 +419,9 @@ export function exitSitePlan(map: MapLibreMap) {
   site.placeMode = null;
   site.features = [];
   site.selectedId = null;
+  site.constraints = null;
   resetFormDefaults();
+  clearConstraintLayers(map);
   clearSiteLayers(map);
   for (const id of ["parcels-line", "parcels-fill-private", "parcels-fill-public", "parcels-label", "county-outline"]) {
     if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", "visible");

@@ -76,3 +76,29 @@ export async function fetchZoningAt(lng: number, lat: number): Promise<string | 
   };
   return data.features?.[0]?.attributes?.zonedesc ?? null;
 }
+
+/** BCRC 12-711: 40 ft from lakes/ponds and intermittent NHD; 75 ft from other flowing streams. */
+export const SHORELINE_WATERBODY_FT = 40;
+export const SHORELINE_STREAM_FT = 75;
+/** Historical Title 12 figure — advisory only; verify with Planning. */
+export const WETLAND_ADVISORY_FT = 40;
+
+/** NHD FCodes treated as intermittent / ephemeral (layer 6). */
+export const INTERMITTENT_FLOWLINE_FCODES = new Set([
+  46003, // StreamRiver Intermittent
+  46007, // StreamRiver Ephemeral
+]);
+
+export function nhdFcode(props: Record<string, unknown> | null | undefined): number | null {
+  if (!props) return null;
+  const raw = props.FCODE ?? props.fcode ?? props.FCode;
+  const n = typeof raw === "number" ? raw : Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+export function shorelineSetbackFt(nhdLayer: number, props?: Record<string, unknown> | null): number {
+  if (nhdLayer === 12) return SHORELINE_WATERBODY_FT;
+  const code = nhdFcode(props);
+  if (code != null && INTERMITTENT_FLOWLINE_FCODES.has(code)) return SHORELINE_WATERBODY_FT;
+  return SHORELINE_STREAM_FT;
+}
