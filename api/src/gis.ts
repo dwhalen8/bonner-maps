@@ -26,7 +26,8 @@ const ENCODED_CAP = 500 * 1024;
 const RAW_CAP = 2 * 1024 * 1024;
 const WALL_MS = 8000;
 const OFFSET_DEG = "0.00005";
-const MAX_INFLIGHT = 2;
+/** Client CORS fallback: `runJobs(federal, 4)` + `runJobs(county, 3)` can POST together. */
+const MAX_INFLIGHT = 7;
 
 /** Same box as `src/types.ts` COUNTY_BOUNDS. Pad so parcel⊕300 ft on the line still intersects. */
 const COUNTY_WEST = -117.05;
