@@ -7,3 +7,6 @@ raw
 .DS_Store
 README.md
 scripts/smoke.mjs
+api/node_modules
+api/dist
+api/data

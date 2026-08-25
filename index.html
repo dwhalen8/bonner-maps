@@ -31,8 +31,44 @@
             <small>Bonner County, Idaho</small>
           </div>
         </div>
-        <button id="install-btn" class="ghost" hidden>Add to phone</button>
+        <div class="header-actions">
+          <button id="signin-btn" class="ghost" type="button">Sign in</button>
+          <span id="signed-in" hidden>
+            <span id="signed-email"></span>
+            <button id="signout-btn" class="ghost" type="button">Sign out</button>
+          </span>
+          <button id="install-btn" class="ghost" hidden>Add to phone</button>
+        </div>
       </header>
+
+      <aside id="auth-panel" class="sheet auth no-print" hidden>
+        <button id="close-auth" class="icon-x" aria-label="Close sign in">×</button>
+        <h2>Sign in</h2>
+        <p class="hint">
+          Request the code from the same place you will type it (home-screen app vs Safari).
+        </p>
+        <form id="auth-form">
+          <label>Email
+            <input id="auth-email" type="email" autocomplete="username" inputmode="email" required />
+          </label>
+          <button id="auth-send" class="primary" type="button">Send code</button>
+          <label>Code
+            <input
+              id="auth-code"
+              type="text"
+              inputmode="numeric"
+              pattern="[0-9]*"
+              autocomplete="one-time-code"
+              maxlength="6"
+            />
+          </label>
+          <button id="auth-verify" class="primary" type="button">Verify</button>
+          <label id="auth-link-wrap" class="check" hidden>
+            <input id="auth-include-link" type="checkbox" /> email me a link
+          </label>
+          <p class="hint" id="auth-status"></p>
+        </form>
+      </aside>
 
       <form id="search-form" class="search no-print" autocomplete="off">
         <input
@@ -45,7 +81,7 @@
         <ul id="search-results" hidden></ul>
       </form>
 
-      <div class="north no-print" aria-hidden="true">N</div>
+      <div class="north" aria-hidden="true">N</div>
       <div class="fab-col no-print">
         <button id="layers-btn" class="fab" title="Layers" aria-label="Layers">☰</button>
         <button id="locate-btn" class="fab" title="My location" aria-label="My location">◎</button>
@@ -57,6 +93,20 @@
         <label><input type="checkbox" id="layer-public" checked /> Public land fill</label>
         <label><input type="checkbox" id="layer-labels" checked /> Owner labels</label>
         <label><input type="checkbox" id="layer-county" checked /> County outline</label>
+        <fieldset id="constraint-layers" hidden>
+          <legend>Site constraints</legend>
+          <label><input type="checkbox" id="layer-flood" checked /> Flood</label>
+          <label><input type="checkbox" id="layer-wetlands" checked /> Wetlands</label>
+          <label><input type="checkbox" id="layer-roads" checked /> Roads</label>
+          <label><input type="checkbox" id="layer-row" checked /> ROW</label>
+          <label><input type="checkbox" id="layer-shoreline" checked /> Shoreline</label>
+          <label><input type="checkbox" id="layer-water" checked /> Water</label>
+          <p class="hint">
+            GIS ROW is not easements of record. Shoreline 40/75 ft from NHD; wetland 40 ft
+            is advisory — verify current Title 12 / BCRC 12-733 with Planning. Fire-district
+            sign-off: verify on the county BLP page. Overlays are session-only.
+          </p>
+        </fieldset>
         <ul class="legend">
           <li><i class="swatch private"></i> Private</li>
           <li><i class="swatch usfs"></i> Federal / USFS</li>
@@ -90,16 +140,25 @@
           <div><dt>Deed</dt><dd id="parcel-deed"></dd></div>
         </dl>
         <p class="disclaimer">
-          Assessor map, not a survey. Lines can be off by many feet. Do not use this
-          to set a fence or decide a property dispute.
+          Assessor map, not a survey and not a filing. Lines can be off by many feet.
+          Do not use this to set a fence or decide a property dispute.
         </p>
-        <button id="open-siteplan" class="primary">Make BLP site map</button>
+        <div class="btn-row parcel-actions">
+          <button id="open-siteplan" class="primary">Make BLP site map</button>
+          <button id="claim-parcel" class="ghost" type="button">Claim this parcel</button>
+        </div>
       </section>
 
       <section id="siteplan-panel" class="sheet siteplan no-print" hidden>
         <button id="close-siteplan" class="icon-x" aria-label="Close site plan">×</button>
         <h2>BLP site map</h2>
+        <div class="view-toggle" role="group" aria-label="Plan or packet view">
+          <button id="view-plan" type="button" class="ghost active" aria-pressed="true">Plan</button>
+          <button id="view-packet" type="button" class="ghost" aria-pressed="false">Packet</button>
+        </div>
+        <p class="hint" id="view-hint">Plan is the working map. Packet hides use areas unless Show on packet is checked.</p>
         <p class="hint" id="site-zone">Select a parcel, then place the proposed structure.</p>
+        <p class="hint">Drafts save on this device per parcel. Tap a mark to select it. Driveway may start off the lot.</p>
         <label>Proposed use
           <input id="site-use" type="text" value="Single-family dwelling" />
         </label>
@@ -121,35 +180,162 @@
           <label>Rotation
             <input id="site-rot" type="number" step="5" value="0" />
           </label>
+          <label>Eave (ft)
+            <input id="site-eave" type="number" min="0" step="0.5" value="2" />
+          </label>
+          <label class="check">
+            <input id="site-existing" type="checkbox" /> Existing
+          </label>
         </div>
         <div class="btn-row">
           <button id="place-structure" type="button" class="ghost">Place structure</button>
           <button id="place-well" type="button" class="ghost">Well</button>
           <button id="place-septic" type="button" class="ghost">Septic</button>
+          <button id="place-door" type="button" class="ghost">Place door</button>
+          <button id="place-driveway" type="button" class="ghost">Driveway</button>
+          <button id="place-leach" type="button" class="ghost">Leach field</button>
+          <button id="place-easement" type="button" class="ghost">Easement</button>
+          <button id="place-use-area" type="button" class="ghost">Use area</button>
+          <button id="finish-draw" type="button" class="ghost" disabled>Finish drawing</button>
+        </div>
+        <div id="use-area-fields" class="row" hidden>
+          <label>Use class
+            <select id="site-use-class">
+              <option value="garden">Garden</option>
+              <option value="pasture">Pasture</option>
+              <option value="timber">Timber</option>
+              <option value="shop_yard">Shop yard</option>
+              <option value="orchard">Orchard</option>
+              <option value="other">Other</option>
+            </select>
+          </label>
+          <label class="check" id="site-on-packet-wrap">
+            <input id="site-on-packet" type="checkbox" /> Show on packet
+          </label>
         </div>
         <ul id="site-distances" class="measures"></ul>
+        <p class="hint">
+          Distances are from greatest projections (eaves/decks), approximate from the
+          assessor map.
+        </p>
         <label>Notes
           <textarea id="site-notes" rows="2" placeholder="Driveway, shoreline, slope, wetlands, existing buildings…"></textarea>
         </label>
+        <label class="check">
+          <input id="site-disturbance" type="checkbox" /> Disturbance above stormwater threshold (BCRC 12-720)
+        </label>
+        <label class="check">
+          <input id="site-slopes" type="checkbox" /> Mapped steep slopes on site (BCRC 12-760)
+        </label>
+        <label class="check">
+          <input id="print-letter" type="checkbox" /> Print on Letter (8.5×11)
+        </label>
         <button id="print-sitemap" class="primary">Print / save PDF</button>
+        <div id="attachment-panel" hidden>
+          <p class="hint">Floor plans, elevations, and the deed are uploads — print the map from this screen.</p>
+          <div class="row">
+            <label>Kind
+              <select id="att-kind">
+                <option value="floor_plan">Floor plan</option>
+                <option value="elevation">Elevation</option>
+                <option value="deed">Deed</option>
+                <option value="fire_signoff">Fire sign-off</option>
+                <option value="other">Other</option>
+              </select>
+            </label>
+          </div>
+          <input id="att-file" type="file" accept=".pdf,.jpg,.jpeg,.png,.heic,.heif,application/pdf,image/*" />
+          <div class="btn-row">
+            <button id="att-upload" type="button" class="ghost">Upload</button>
+            <button id="att-zip" type="button" class="ghost">Download attachments and checklist</button>
+          </div>
+          <p class="hint">County portal prefers PDF or JPEG. In Photos, Share → Export as JPEG if this upload is HEIC.</p>
+          <ul id="att-list" class="measures"></ul>
+        </div>
+        <p class="hint" id="print-hint">
+          On iPhone: Print → Paper Size → Tabloid / 11×17 if you want that sheet. Letter still works; use the labeled distances.
+        </p>
         <p class="disclaimer">
-          Draft only. BCRC 11-105 requires distances from the structure’s greatest
-          projections to every property line and environmental features. Confirm setbacks
-          in Tables 12-411 / 12-412. This is not a survey.
+          Draft only — not a survey and not a filing. BCRC 11-105 requires distances from
+          the structure’s greatest projections to every property line and environmental
+          features. Architectural projections cannot enter the setback. Confirm setbacks
+          in Tables 12-411 / 12-412. NWI wetlands are inventory, not a delineation. FEMA
+          NFHL is not a floodplain development permit. Wetland 40 ft is advisory (verify
+          Title 12). Fire sign-off: verify on the county site. This is not the official
+          BLP application.
         </p>
       </section>
 
       <aside id="print-block" class="print-only">
-        <h1>Bonner County Building Location Permit — Site Plan (draft)</h1>
-        <p id="print-meta"></p>
-        <p id="print-measures"></p>
-        <p id="print-notes"></p>
-        <p class="print-disclaimer">
-          Assessor parcel map, not a land survey. Distances are approximate. Confirm
-          setbacks, floodplain, shorelines, and wetlands with Bonner County Planning
-          (208-265-1458) before construction. Official application:
-          bonnercountyid.gov/building-location-permit
-        </p>
+        <section class="print-title-block">
+          <h1>Bonner County Building Location Permit — Site Plan (draft)</h1>
+          <dl id="print-meta" class="print-meta"></dl>
+          <p id="print-scale"></p>
+          <p id="print-setback-note"></p>
+          <p id="print-measures-note"></p>
+          <table id="print-measures-table">
+            <thead>
+              <tr>
+                <th>Structure</th>
+                <th>Eave</th>
+                <th>Lot line</th>
+                <th>Line length</th>
+                <th>To projection</th>
+              </tr>
+            </thead>
+            <tbody id="print-measures"></tbody>
+          </table>
+          <p id="print-advisories"></p>
+          <p id="print-water"></p>
+          <p id="print-notes"></p>
+          <div class="print-sign">
+            <label>Owner signature <span class="line"></span></label>
+            <label>Date <span class="line"></span></label>
+          </div>
+          <p class="print-disclaimer">
+            Assessor parcel map, not a land survey. Distances are from greatest
+            projections (eaves/decks) and are approximate. Architectural projections
+            cannot enter the setback. Confirm setbacks, floodplain, shorelines, and
+            wetlands with Bonner County Planning (208-265-1458) before construction.
+            This is not the official BLP application. File at
+            bonnercountyid.gov/building-location-permit. NWI wetlands are inventory,
+            not a delineation. FEMA NFHL is not a floodplain development permit.
+            This app does not file a Building Location Permit.
+          </p>
+        </section>
+        <section class="print-checklist">
+          <h2>BLP remaining items</h2>
+          <p class="print-check-note">
+            County permits are never marked issued here. Incomplete GIS clips do not
+            clear an item. Print the site plan from this screen; attach floor plans,
+            elevations, and the recorded deed with the county filing.
+          </p>
+          <h3>Always required</h3>
+          <ul id="print-check-always"></ul>
+          <h3>Often needed</h3>
+          <ul id="print-check-often"></ul>
+          <h3>Envelope distances (every structure × every lot line)</h3>
+          <table id="print-measures-all-table">
+            <thead>
+              <tr>
+                <th>Structure</th>
+                <th>Eave</th>
+                <th>Lot line</th>
+                <th>Line length</th>
+                <th>To projection</th>
+              </tr>
+            </thead>
+            <tbody id="print-measures-all"></tbody>
+          </table>
+        </section>
+      </aside>
+
+      <aside id="sync-conflict" class="sheet conflict no-print" hidden>
+        <p id="sync-conflict-msg">Newer copy on server — Keep mine / Take server</p>
+        <div class="btn-row">
+          <button id="keep-mine" class="primary" type="button">Keep mine</button>
+          <button id="take-server" class="ghost" type="button">Take server</button>
+        </div>
       </aside>
 
       <footer class="chrome bottom no-print">

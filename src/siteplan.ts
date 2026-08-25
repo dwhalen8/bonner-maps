@@ -1,11 +1,28 @@
 import type { GeoJSONSource, Map as MapLibreMap } from "maplibre-gl";
-import type { Feature, FeatureCollection, Point, Polygon, MultiPolygon, Position } from "geojson";
+import type {
+  Feature,
+  FeatureCollection,
+  Geometry,
+  LineString,
+  Point,
+  Polygon,
+  MultiPolygon,
+  Position,
+} from "geojson";
+import { lineString, point } from "@turf/helpers";
+import nearestPointOnLine from "@turf/nearest-point-on-line";
+import type { FeatureKind, FeatureStatus, PlanDoc, PlanFeature, UseAreaClass } from "@shared/plan";
+import { PLAN_DOC_VERSION, toParcelSnapshot } from "@shared/plan";
+import { flushClaimedSync, saveClaimedLocal, type StoredPlan } from "./plan-store";
 import type { ParcelProps } from "./types";
 import {
   compass,
+  eaveEnvelope,
+  feetBetween,
   formatFeet,
   inwardSetback,
   minDistToEdgeFt,
+  nearestOnPolygonFt,
   parcelBbox,
   parcelCentroid,
   parcelEdges,
@@ -13,19 +30,46 @@ import {
   rectanglePolygon,
 } from "./geo";
 import { fetchZoningAt, ruleForZone, type SetbackRule } from "./setbacks";
+import { cancelConstraintOverlays, type ConstraintClip } from "./constraints";
+import { addConstraintLayers, addHatchPatterns, clearConstraintLayers, setDoubleClickZoom, USE_AREA_HATCH_IDS } from "./map";
 
-export type SiteKind = "structure" | "well" | "septic";
+export type PointKind = "structure" | "well" | "septic" | "front_door";
+export type DrawKind = "driveway" | "leach" | "easement" | "use_area";
+export type SiteKind = PointKind | DrawKind;
 export type PlaceMode = null | SiteKind;
+export type PlanView = "plan" | "packet";
+export type { UseAreaClass };
 
-export interface SiteMark {
-  id: string;
-  kind: SiteKind;
-  label: string;
-  center: Position;
-  widthFt?: number;
-  lengthFt?: number;
-  rotationDeg?: number;
+export const USE_AREA_CLASSES: UseAreaClass[] = [
+  "garden",
+  "pasture",
+  "timber",
+  "shop_yard",
+  "orchard",
+  "other",
+];
+
+export const USE_AREA_LABELS: Record<UseAreaClass, string> = {
+  garden: "Garden",
+  pasture: "Pasture",
+  timber: "Timber",
+  shop_yard: "Shop yard",
+  orchard: "Orchard",
+  other: "Use area",
+};
+
+export function parseUseClass(value: string | undefined | null): UseAreaClass {
+  return USE_AREA_CLASSES.includes(value as UseAreaClass) ? (value as UseAreaClass) : "other";
 }
+
+/** Panhandle Health commonly wants 100 ft well→septic. Advisory only. */
+export const WELL_SEPTIC_ADVISORY_FT = 100;
+/** Proposed driveway "meets" a road at this distance (PR 6 checklist). */
+export const DRIVEWAY_MEETS_ROAD_FT = 30;
+
+export const DEFAULT_EAVE_FT = 2;
+export const DOOR_SNAP_FT = 12;
+export const DOOR_REJECT_MSG = "Tap on the building edge (door must sit on the wall/eave).";
 
 export interface SiteState {
   active: boolean;
@@ -35,11 +79,33 @@ export interface SiteState {
   rule: SetbackRule;
   lineFt: number;
   accessory: boolean;
-  marks: SiteMark[];
+  features: PlanFeature[];
   selectedId: string | null;
   placeMode: PlaceMode;
+  /** In-progress vertex-draw ring/line. Not persisted until Finish. */
+  drawVertices: Position[];
+  status: FeatureStatus;
+  widthFt: number;
+  lengthFt: number;
+  rotationDeg: number;
+  eaveFt: number;
   use: string;
   notes: string;
+  /** Plan = working map; Packet = BLP preview. Filters overlays only — not a second document. */
+  view: PlanView;
+  useClass: UseAreaClass;
+  /** Frozen at startSitePlan; persist key. Not the inspector parcel. */
+  draftPin: string | null;
+  /** RAM-only GIS clips. Never written to localStorage. */
+  constraints: ConstraintClip | null;
+  planId: string | null;
+  serverRev: number;
+}
+
+export interface SitePlanSession {
+  pin: string;
+  hadDraft: boolean;
+  lineFtAtStart: number;
 }
 
 export const site: SiteState = {
@@ -50,14 +116,427 @@ export const site: SiteState = {
   rule: ruleForZone(null),
   lineFt: 25,
   accessory: false,
-  marks: [],
+  features: [],
   selectedId: null,
   placeMode: null,
+  drawVertices: [],
+  status: "proposed",
+  widthFt: 40,
+  lengthFt: 60,
+  rotationDeg: 0,
+  eaveFt: DEFAULT_EAVE_FT,
   use: "Single-family dwelling",
   notes: "",
+  view: "plan",
+  useClass: "garden",
+  draftPin: null,
+  constraints: null,
+  planId: null,
+  serverRev: 0,
 };
 
 const empty = (): FeatureCollection => ({ type: "FeatureCollection", features: [] });
+
+const SITE_SOURCES = [
+  "site-parcel",
+  "site-setback",
+  "site-edges",
+  "site-envelope",
+  "site-structure",
+  "site-points",
+  "site-driveway",
+  "site-leach",
+  "site-easement",
+  "site-use-area",
+  "site-draw",
+] as const;
+
+const DOUBLE_TAP_MS = 450;
+const DOUBLE_TAP_PX = 18;
+/** Keep map zoom off until after the finishing dblclick / tap-zoom window. */
+const DRAW_ZOOM_HOLD_MS = 450;
+
+let lastTapAt = 0;
+let lastTapPos: Position | null = null;
+let zoomHoldTimer = 0;
+let zoomHoldUntil = 0;
+
+export function isDrawKind(kind: string | null | undefined): kind is DrawKind {
+  return kind === "driveway" || kind === "leach" || kind === "easement" || kind === "use_area";
+}
+
+export function isPointKind(kind: string | null | undefined): kind is PointKind {
+  return kind === "structure" || kind === "well" || kind === "septic" || kind === "front_door";
+}
+
+export function minDrawVertices(kind: DrawKind) {
+  return kind === "driveway" ? 2 : 3;
+}
+
+export function canFinishDraw() {
+  return isDrawKind(site.placeMode) && stripTailDuplicate(site.drawVertices).length >= minDrawVertices(site.placeMode);
+}
+
+export function shouldPreventDrawZoom() {
+  return isDrawKind(site.placeMode) || performance.now() < zoomHoldUntil;
+}
+
+export function drawPrompt() {
+  const kind = site.placeMode;
+  if (!isDrawKind(kind)) return "";
+  const n = site.drawVertices.length;
+  const min = minDrawVertices(kind);
+  const start =
+    kind === "driveway"
+      ? "Tap driveway vertices. May start off the lot."
+      : kind === "leach"
+        ? "Tap leach field vertices on the lot."
+        : kind === "use_area"
+          ? "Tap use-area vertices on the lot."
+          : "Tap easement vertices.";
+  if (n === 0) return `${start} Finish or double-tap to complete.`;
+  if (n < min) return `${n} vertex${n === 1 ? "" : "es"} · need ${min} to finish`;
+  return `${n} vertices · Finish or double-tap to complete`;
+}
+
+function draftKey(pin: string) {
+  return `bonner-anon-draft:${pin}`;
+}
+
+function featureCenter(feature: PlanFeature): Position | null {
+  return feature.geom.type === "Point" ? feature.geom.coordinates : null;
+}
+
+function defaultLabel(kind: FeatureKind, status: FeatureStatus, useClass?: string) {
+  const existing = status === "existing";
+  switch (kind) {
+    case "structure":
+      return existing ? "Existing structure" : "Proposed structure";
+    case "well":
+      return existing ? "Existing well" : "Well";
+    case "septic":
+      return existing ? "Existing septic" : "Septic";
+    case "front_door":
+      return "Front door";
+    case "driveway":
+      return existing ? "Existing driveway" : "Driveway";
+    case "leach":
+      return existing ? "Existing leach field" : "Leach field";
+    case "easement":
+      return existing ? "Existing easement" : "Easement";
+    case "use_area": {
+      const name = USE_AREA_LABELS[parseUseClass(useClass)];
+      return existing ? `Existing ${name.toLowerCase()}` : name;
+    }
+    default:
+      return kind;
+  }
+}
+
+function minDistToLineFt(from: Position, coords: Position[]) {
+  if (coords.length < 2) return Infinity;
+  const snapped = nearestPointOnLine(lineString(coords), point(from), { units: "feet" });
+  return snapped.properties.dist ?? Infinity;
+}
+
+function orient(a: Position, b: Position, c: Position) {
+  return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+}
+
+function segmentsCross(a: Position, b: Position, c: Position, d: Position) {
+  const o1 = orient(a, b, c);
+  const o2 = orient(a, b, d);
+  const o3 = orient(c, d, a);
+  const o4 = orient(c, d, b);
+  return o1 * o2 < 0 && o3 * o4 < 0;
+}
+
+function segmentDistFt(a: Position, b: Position, c: Position, d: Position) {
+  if (segmentsCross(a, b, c, d)) return 0;
+  return Math.min(
+    minDistToLineFt(a, [c, d]),
+    minDistToLineFt(b, [c, d]),
+    minDistToLineFt(c, [a, b]),
+    minDistToLineFt(d, [a, b]),
+  );
+}
+
+function drivewayCoords(
+  driveway: Feature<LineString> | LineString | PlanFeature,
+): Position[] | null {
+  if ("geom" in driveway) {
+    return driveway.geom.type === "LineString" ? driveway.geom.coordinates : null;
+  }
+  if (driveway.type === "Feature") {
+    return driveway.geometry.type === "LineString" ? driveway.geometry.coordinates : null;
+  }
+  return driveway.coordinates;
+}
+
+function roadLineCoords(geom: Geometry | null | undefined): Position[][] {
+  if (!geom) return [];
+  if (geom.type === "LineString") return [geom.coordinates];
+  if (geom.type === "MultiLineString") return geom.coordinates;
+  return [];
+}
+
+/** True when any driveway segment is ≤ 30 ft from any road segment (including crossings). */
+export function drivewayMeetsRoad(
+  driveway: Feature<LineString> | LineString | PlanFeature,
+  roadFeatures?: FeatureCollection | Feature[] | null,
+): boolean {
+  if (!roadFeatures) return false;
+  const roads = Array.isArray(roadFeatures) ? roadFeatures : roadFeatures.features;
+  if (!roads.length) return false;
+  const coords = drivewayCoords(driveway);
+  if (!coords || coords.length < 2) return false;
+  for (const road of roads) {
+    const geom = "geometry" in road ? road.geometry : null;
+    for (const line of roadLineCoords(geom)) {
+      if (line.length < 2) continue;
+      for (let i = 0; i < coords.length - 1; i++) {
+        for (let j = 0; j < line.length - 1; j++) {
+          if (segmentDistFt(coords[i], coords[i + 1], line[j], line[j + 1]) <= DRIVEWAY_MEETS_ROAD_FT) {
+            return true;
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
+
+export function wellSepticAdvisory(): string[] {
+  const wells = site.features.filter((f) => f.kind === "well").map(featureCenter).filter(Boolean) as Position[];
+  const septics = site.features.filter((f) => f.kind === "septic").map(featureCenter).filter(Boolean) as Position[];
+  if (!wells.length || !septics.length) return [];
+  let min = Infinity;
+  for (const well of wells) {
+    for (const septic of septics) {
+      min = Math.min(min, feetBetween(well, septic));
+    }
+  }
+  if (min >= WELL_SEPTIC_ADVISORY_FT) return [];
+  return [`Well–septic ${formatFeet(min)} — Panhandle Health commonly wants ${WELL_SEPTIC_ADVISORY_FT} ft`];
+}
+
+/** Uses the clipped Transportation merge (layers 3/4/5/7). ≤30 ft of a proposed driveway. */
+export function encroachmentAdvisory(roadFeatures?: FeatureCollection | Feature[] | null): string[] {
+  const out: string[] = [];
+  for (const feature of site.features) {
+    if (feature.kind !== "driveway" || feature.status !== "proposed") continue;
+    if (drivewayMeetsRoad(feature, roadFeatures)) {
+      out.push("Proposed driveway is within 30 ft of a road — encroachment permit may be needed");
+    }
+  }
+  return out;
+}
+
+function structurePoly(feature: PlanFeature) {
+  const center = featureCenter(feature);
+  const width = feature.props.widthFt;
+  const length = feature.props.lengthFt;
+  if (!center || !width || !length) return null;
+  return rectanglePolygon(center, width, length, feature.props.rotationDeg ?? 0);
+}
+
+function structureEaveFt(feature: PlanFeature) {
+  const n = feature.props.eaveFt;
+  return n != null && Number.isFinite(n) && n >= 0 ? n : DEFAULT_EAVE_FT;
+}
+
+function structureEnvelope(feature: PlanFeature) {
+  const poly = structurePoly(feature);
+  if (!poly) return null;
+  return eaveEnvelope(poly, structureEaveFt(feature));
+}
+
+function isDraftFeature(value: unknown): value is PlanFeature {
+  if (!value || typeof value !== "object") return false;
+  const f = value as PlanFeature;
+  return typeof f.id === "string" && typeof f.kind === "string" && !!f.geom;
+}
+
+function loadDraft(pin: string): PlanDoc | null {
+  try {
+    const raw = localStorage.getItem(draftKey(pin));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as PlanDoc;
+    if (!parsed || parsed.pin !== pin) return null;
+    if (parsed.version != null && parsed.version !== PLAN_DOC_VERSION) return null;
+    if (!Array.isArray(parsed.features)) parsed.features = [];
+    parsed.features = parsed.features.filter(isDraftFeature).map((f) => {
+      const props = { ...(f.props ?? {}) };
+      if (f.kind === "use_area") props.useClass = parseUseClass(props.useClass);
+      if (f.kind === "structure") props.eaveFt = props.eaveFt ?? DEFAULT_EAVE_FT;
+      const status = f.status === "existing" ? "existing" : "proposed";
+      return {
+        ...f,
+        status,
+        label: f.kind === "front_door" ? "Front door" : f.label || defaultLabel(f.kind, status, props.useClass),
+        onPacket: f.kind === "use_area" ? f.onPacket === true : f.onPacket !== false,
+        props,
+      };
+    });
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+let persistTimer = 0;
+let sessionParcel: ParcelProps | null = null;
+
+function snapshotDoc(): PlanDoc | null {
+  const pin = site.draftPin;
+  if (!pin || !site.geom || !sessionParcel) return null;
+  const now = new Date().toISOString();
+  return {
+    version: PLAN_DOC_VERSION,
+    pin,
+    title: site.use,
+    use: site.use,
+    notes: site.notes,
+    lineFt: site.lineFt,
+    accessory: site.accessory,
+    parcel: {
+      props: toParcelSnapshot(sessionParcel),
+      geom: site.geom,
+      snapshotAt: now,
+    },
+    features: site.features,
+    constraints: null, // clips stay in RAM; localStorage is quota-safe
+    checklist: [],
+    clientEditedAt: now,
+  };
+}
+
+export async function persistDraft(): Promise<void> {
+  window.clearTimeout(persistTimer);
+  persistTimer = 0;
+  const planId = site.planId;
+  const doc = snapshotDoc();
+  if (!doc) return;
+  if (planId) {
+    await saveClaimedLocal(planId, doc);
+    return;
+  }
+  try {
+    localStorage.setItem(draftKey(doc.pin), JSON.stringify(doc));
+  } catch {
+    // private mode / quota — keep working in memory
+  }
+}
+
+export async function flushPersist(): Promise<void> {
+  window.clearTimeout(persistTimer);
+  persistTimer = 0;
+  await persistDraft();
+}
+
+export function peekAnonDraft(pin: string): PlanDoc | null {
+  if (site.draftPin === pin) {
+    const live = snapshotDoc();
+    if (live) return live;
+  }
+  return loadDraft(pin);
+}
+
+export function dropClaimed(id: string) {
+  if (site.planId === id) {
+    site.planId = null;
+    site.serverRev = 0;
+  }
+}
+
+export function clearAnonDraft(pin: string) {
+  try {
+    localStorage.removeItem(draftKey(pin));
+  } catch {
+    /* ignore */
+  }
+}
+
+export function docForClaim(props: ParcelProps, geom: Polygon | MultiPolygon): PlanDoc {
+  const pin = props.pin;
+  const now = new Date().toISOString();
+  const live = site.draftPin === pin ? snapshotDoc() : null;
+  const draft = live ?? loadDraft(pin);
+  return {
+    version: PLAN_DOC_VERSION,
+    pin,
+    title: draft?.title || draft?.use || props.addr || props.o1 || pin,
+    use: draft?.use || "Single-family dwelling",
+    notes: draft?.notes ?? "",
+    lineFt: typeof draft?.lineFt === "number" ? draft.lineFt : 25,
+    accessory: Boolean(draft?.accessory),
+    parcel: {
+      props: toParcelSnapshot(props),
+      geom,
+      snapshotAt: now,
+    },
+    features: Array.isArray(draft?.features) ? draft.features.filter(isDraftFeature) : [],
+    constraints: null,
+    checklist: Array.isArray(draft?.checklist) ? draft.checklist : [],
+    clientEditedAt: now,
+  };
+}
+
+export function applyClaimedPlan(plan: StoredPlan) {
+  const doc = plan.doc;
+  site.planId = plan.id;
+  site.serverRev = plan.serverRev;
+  site.use = typeof doc.use === "string" && doc.use ? doc.use : "Single-family dwelling";
+  site.notes = typeof doc.notes === "string" ? doc.notes : "";
+  site.lineFt = typeof doc.lineFt === "number" ? doc.lineFt : 25;
+  site.accessory = Boolean(doc.accessory);
+  site.features = Array.isArray(doc.features) ? doc.features.filter(isDraftFeature) : [];
+  if (doc.parcel?.geom) site.geom = doc.parcel.geom as Polygon | MultiPolygon;
+  const lastStruct = [...site.features].reverse().find((f) => f.kind === "structure");
+  site.selectedId = lastStruct?.id ?? site.features.at(-1)?.id ?? null;
+  const selected = site.features.find((f) => f.id === site.selectedId);
+  if (selected) site.status = selected.status;
+  if (selected?.kind === "structure") {
+    site.widthFt = selected.props.widthFt ?? 40;
+    site.lengthFt = selected.props.lengthFt ?? 60;
+    site.rotationDeg = selected.props.rotationDeg ?? 0;
+  }
+}
+
+export function ackServerRev(id: string, serverRev: number) {
+  if (site.planId === id) site.serverRev = serverRev;
+}
+
+export function setClaimed(plan: StoredPlan) {
+  site.planId = plan.id;
+  site.serverRev = plan.serverRev;
+}
+
+export function schedulePersist() {
+  window.clearTimeout(persistTimer);
+  persistTimer = window.setTimeout(() => persistDraft(), 400);
+}
+
+window.addEventListener("pagehide", () => {
+  window.clearTimeout(persistTimer);
+  persistTimer = 0;
+  const planId = site.planId;
+  const doc = snapshotDoc();
+  if (planId && doc) {
+    void flushClaimedSync({
+      keepalive: true,
+      snapshot: { id: planId, doc },
+    });
+    return;
+  }
+  if (doc) {
+    try {
+      localStorage.setItem(draftKey(doc.pin), JSON.stringify(doc));
+    } catch {
+      /* private mode / quota */
+    }
+  }
+});
 
 function setSrc(map: MapLibreMap, id: string, data: FeatureCollection) {
   const src = map.getSource(id) as GeoJSONSource | undefined;
@@ -65,14 +544,8 @@ function setSrc(map: MapLibreMap, id: string, data: FeatureCollection) {
 }
 
 export function addSiteLayers(map: MapLibreMap) {
-  const layers: [string, string][] = [
-    ["site-parcel", "geojson"],
-    ["site-setback", "geojson"],
-    ["site-edges", "geojson"],
-    ["site-structure", "geojson"],
-    ["site-points", "geojson"],
-  ];
-  for (const [id] of layers) {
+  addHatchPatterns(map);
+  for (const id of SITE_SOURCES) {
     if (map.getSource(id)) continue;
     map.addSource(id, { type: "geojson", data: empty() });
   }
@@ -126,16 +599,32 @@ export function addSiteLayers(map: MapLibreMap) {
       },
     });
     map.addLayer({
+      id: "site-envelope-line",
+      type: "line",
+      source: "site-envelope",
+      paint: {
+        "line-color": ["match", ["get", "status"], "existing", "#6c757d", "#c1121f"],
+        "line-width": ["case", ["boolean", ["get", "selected"], false], 2.2, 1.4],
+        "line-dasharray": [3, 2],
+      },
+    });
+    map.addLayer({
       id: "site-structure-fill",
       type: "fill",
       source: "site-structure",
-      paint: { "fill-color": "#c1121f", "fill-opacity": 0.35 },
+      paint: {
+        "fill-color": ["match", ["get", "status"], "existing", "#6c757d", "#c1121f"],
+        "fill-opacity": 0.35,
+      },
     });
     map.addLayer({
       id: "site-structure-line",
       type: "line",
       source: "site-structure",
-      paint: { "line-color": "#6a040f", "line-width": 2 },
+      paint: {
+        "line-color": ["match", ["get", "status"], "existing", "#343a40", "#6a040f"],
+        "line-width": ["case", ["boolean", ["get", "selected"], false], 3.2, 2],
+      },
     });
     map.addLayer({
       id: "site-structure-label",
@@ -153,7 +642,7 @@ export function addSiteLayers(map: MapLibreMap) {
       type: "circle",
       source: "site-points",
       paint: {
-        "circle-radius": 6,
+        "circle-radius": ["case", ["boolean", ["get", "selected"], false], 7.5, 6],
         "circle-color": [
           "match",
           ["get", "kind"],
@@ -161,6 +650,8 @@ export function addSiteLayers(map: MapLibreMap) {
           "#0077b6",
           "septic",
           "#9c6644",
+          "front_door",
+          "#c9a227",
           "#333",
         ],
         "circle-stroke-color": "#fff",
@@ -180,12 +671,225 @@ export function addSiteLayers(map: MapLibreMap) {
       paint: { "text-color": "#111", "text-halo-color": "#fff", "text-halo-width": 1.3 },
     });
   }
+
+  if (!map.getLayer("site-driveway-line")) {
+    map.addLayer({
+      id: "site-driveway-line",
+      type: "line",
+      source: "site-driveway",
+      paint: {
+        "line-color": ["match", ["get", "status"], "existing", "#8d6e63", "#e09f3e"],
+        "line-width": ["case", ["boolean", ["get", "selected"], false], 5, 3.2],
+      },
+    });
+    map.addLayer({
+      id: "site-driveway-label",
+      type: "symbol",
+      source: "site-driveway",
+      layout: {
+        "text-field": ["get", "label"],
+        "text-size": 11,
+        "text-font": ["Noto Sans Regular"],
+        "symbol-placement": "line",
+      },
+      paint: { "text-color": "#111", "text-halo-color": "#fff", "text-halo-width": 1.3 },
+    });
+  }
+
+  if (!map.getLayer("site-leach-fill")) {
+    map.addLayer({
+      id: "site-leach-fill",
+      type: "fill",
+      source: "site-leach",
+      paint: {
+        "fill-color": ["match", ["get", "status"], "existing", "#a98467", "#c9a227"],
+        "fill-opacity": 0.32,
+      },
+    });
+    map.addLayer({
+      id: "site-leach-line",
+      type: "line",
+      source: "site-leach",
+      paint: {
+        "line-color": ["match", ["get", "status"], "existing", "#6f4e37", "#9c6644"],
+        "line-width": ["case", ["boolean", ["get", "selected"], false], 2.8, 1.6],
+        "line-dasharray": [2, 1],
+      },
+    });
+    map.addLayer({
+      id: "site-leach-label",
+      type: "symbol",
+      source: "site-leach",
+      layout: {
+        "text-field": ["get", "label"],
+        "text-size": 11,
+        "text-font": ["Noto Sans Regular"],
+      },
+      paint: { "text-color": "#111", "text-halo-color": "#fff", "text-halo-width": 1.3 },
+    });
+  }
+
+  if (!map.getLayer("site-easement-fill")) {
+    map.addLayer({
+      id: "site-easement-fill",
+      type: "fill",
+      source: "site-easement",
+      paint: {
+        "fill-color": "#7b2cbf",
+        "fill-opacity": 0.16,
+      },
+    });
+    map.addLayer({
+      id: "site-easement-line",
+      type: "line",
+      source: "site-easement",
+      paint: {
+        "line-color": ["case", ["boolean", ["get", "selected"], false], "#5a189a", "#7b2cbf"],
+        "line-width": ["case", ["boolean", ["get", "selected"], false], 2.8, 1.6],
+        "line-dasharray": [4, 2],
+      },
+    });
+    map.addLayer({
+      id: "site-easement-label",
+      type: "symbol",
+      source: "site-easement",
+      layout: {
+        "text-field": ["get", "label"],
+        "text-size": 11,
+        "text-font": ["Noto Sans Regular"],
+      },
+      paint: { "text-color": "#111", "text-halo-color": "#fff", "text-halo-width": 1.3 },
+    });
+  }
+
+  if (!map.getLayer("site-use-area-fill")) {
+    const under = map.getLayer("site-structure-fill") ? "site-structure-fill" : undefined;
+    map.addLayer(
+      {
+        id: "site-use-area-fill",
+        type: "fill",
+        source: "site-use-area",
+        paint: {
+          "fill-color": [
+            "match",
+            ["get", "useClass"],
+            "garden",
+            "#52b788",
+            "pasture",
+            "#a7c957",
+            "timber",
+            "#2d6a4f",
+            "shop_yard",
+            "#8d6e63",
+            "orchard",
+            "#e76f51",
+            "#d4b46a",
+          ],
+          "fill-opacity": 0.22,
+        },
+      },
+      under,
+    );
+    map.addLayer(
+      {
+        id: "site-use-area-hatch",
+        type: "fill",
+        source: "site-use-area",
+        paint: {
+          "fill-pattern": [
+            "match",
+            ["get", "useClass"],
+            "garden",
+            USE_AREA_HATCH_IDS.garden,
+            "pasture",
+            USE_AREA_HATCH_IDS.pasture,
+            "timber",
+            USE_AREA_HATCH_IDS.timber,
+            "shop_yard",
+            USE_AREA_HATCH_IDS.shop_yard,
+            "orchard",
+            USE_AREA_HATCH_IDS.orchard,
+            USE_AREA_HATCH_IDS.other,
+          ],
+        },
+      },
+      under,
+    );
+    map.addLayer(
+      {
+        id: "site-use-area-line",
+        type: "line",
+        source: "site-use-area",
+        paint: {
+          "line-color": [
+            "match",
+            ["get", "useClass"],
+            "garden",
+            "#2d6a4f",
+            "pasture",
+            "#6a994e",
+            "timber",
+            "#1b4332",
+            "shop_yard",
+            "#6c584c",
+            "orchard",
+            "#bc4749",
+            "#b08968",
+          ],
+          "line-width": ["case", ["boolean", ["get", "selected"], false], 2.8, 1.6],
+        },
+      },
+      under,
+    );
+    map.addLayer({
+      id: "site-use-area-label",
+      type: "symbol",
+      source: "site-use-area",
+      layout: {
+        "text-field": ["get", "label"],
+        "text-size": 12,
+        "text-font": ["Noto Sans Regular"],
+      },
+      paint: { "text-color": "#111", "text-halo-color": "#fff", "text-halo-width": 1.4 },
+    });
+  }
+
+  if (!map.getLayer("site-draw-fill")) {
+    map.addLayer({
+      id: "site-draw-fill",
+      type: "fill",
+      source: "site-draw",
+      filter: ["==", ["geometry-type"], "Polygon"],
+      paint: { "fill-color": "#ffd166", "fill-opacity": 0.14 },
+    });
+    map.addLayer({
+      id: "site-draw-line",
+      type: "line",
+      source: "site-draw",
+      filter: [
+        "any",
+        ["==", ["geometry-type"], "LineString"],
+        ["==", ["geometry-type"], "Polygon"],
+      ],
+      paint: { "line-color": "#ffd166", "line-width": 2.2, "line-dasharray": [2, 1] },
+    });
+    map.addLayer({
+      id: "site-draw-vertices",
+      type: "circle",
+      source: "site-draw",
+      filter: ["==", ["geometry-type"], "Point"],
+      paint: {
+        "circle-radius": 5,
+        "circle-color": "#ffd166",
+        "circle-stroke-color": "#111",
+        "circle-stroke-width": 1.2,
+      },
+    });
+  }
 }
 
 export function clearSiteLayers(map: MapLibreMap) {
-  for (const id of ["site-parcel", "site-setback", "site-edges", "site-structure", "site-points"]) {
-    setSrc(map, id, empty());
-  }
+  for (const id of SITE_SOURCES) setSrc(map, id, empty());
 }
 
 export function fitParcel(map: MapLibreMap, geom: Polygon | MultiPolygon) {
@@ -199,18 +903,82 @@ export function fitParcel(map: MapLibreMap, geom: Polygon | MultiPolygon) {
   );
 }
 
-export async function startSitePlan(
+function resetFormDefaults() {
+  site.use = "Single-family dwelling";
+  site.notes = "";
+  site.accessory = false;
+  site.lineFt = 25;
+  site.widthFt = 40;
+  site.lengthFt = 60;
+  site.rotationDeg = 0;
+  site.eaveFt = DEFAULT_EAVE_FT;
+  site.status = "proposed";
+  site.useClass = "garden";
+  site.zoning = null;
+  site.rule = ruleForZone(null);
+}
+
+export function startSitePlan(
   map: MapLibreMap,
   parcel: ParcelProps,
   geom: Polygon | MultiPolygon,
-) {
+  claimed?: StoredPlan | null,
+): SitePlanSession {
+  persistDraft();
+
   site.active = true;
+  site.draftPin = parcel.pin;
+  sessionParcel = parcel;
   site.parcel = parcel;
   site.geom = geom;
-  site.marks = [];
   site.selectedId = null;
   site.placeMode = null;
+  site.drawVertices = [];
+  lastTapAt = 0;
+  lastTapPos = null;
+  clearZoomHold();
+  setDoubleClickZoom(map, true);
+  site.status = "proposed";
+  site.view = "plan";
+  site.useClass = "garden";
+  site.zoning = null;
+  site.rule = ruleForZone(null);
+  site.constraints = null;
+  cancelConstraintOverlays();
+  site.planId = claimed?.id ?? null;
+  site.serverRev = claimed?.serverRev ?? 0;
+
+  const draft = claimed?.doc ?? (parcel.pin ? loadDraft(parcel.pin) : null);
+  if (draft) {
+    site.use = typeof draft.use === "string" && draft.use ? draft.use : "Single-family dwelling";
+    site.notes = typeof draft.notes === "string" ? draft.notes : "";
+    site.lineFt = typeof draft.lineFt === "number" ? draft.lineFt : 25;
+    site.accessory = Boolean(draft.accessory);
+    site.features = draft.features;
+    const lastStruct = [...site.features].reverse().find((f) => f.kind === "structure");
+    site.selectedId = lastStruct?.id ?? site.features.at(-1)?.id ?? null;
+    const selected = site.features.find((f) => f.id === site.selectedId);
+    if (selected) site.status = selected.status;
+    if (selected?.kind === "structure") {
+      site.widthFt = selected.props.widthFt ?? 40;
+      site.lengthFt = selected.props.lengthFt ?? 60;
+      site.rotationDeg = selected.props.rotationDeg ?? 0;
+      site.eaveFt = selected.props.eaveFt ?? DEFAULT_EAVE_FT;
+    } else {
+      site.widthFt = 40;
+      site.lengthFt = 60;
+      site.rotationDeg = 0;
+      site.eaveFt = DEFAULT_EAVE_FT;
+    }
+    if (selected?.kind === "use_area") site.useClass = parseUseClass(selected.props.useClass);
+  } else {
+    site.features = [];
+    resetFormDefaults();
+  }
+
   addSiteLayers(map);
+  addConstraintLayers(map);
+  clearConstraintLayers(map);
   for (const id of ["parcels-line", "parcels-fill-private", "parcels-fill-public", "parcels-label", "county-outline"]) {
     if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", "none");
   }
@@ -220,23 +988,56 @@ export async function startSitePlan(
   });
   fitParcel(map, geom);
   refreshOverlays(map);
-  const [lng, lat] = parcelCentroid(geom);
+  return {
+    pin: parcel.pin,
+    hadDraft: Boolean(draft),
+    lineFtAtStart: site.lineFt,
+  };
+}
+
+export async function refreshSiteZoning(map: MapLibreMap, session: SitePlanSession) {
+  if (!site.geom || site.draftPin !== session.pin) return;
+  const [lng, lat] = parcelCentroid(site.geom);
+  let zoning: string | null = null;
   try {
-    site.zoning = await fetchZoningAt(lng, lat);
+    zoning = await fetchZoningAt(lng, lat);
   } catch {
-    site.zoning = null;
+    zoning = null;
   }
+  if (!site.active || site.draftPin !== session.pin) return;
+  site.zoning = zoning;
   site.rule = ruleForZone(site.zoning);
-  if (!site.accessory) site.lineFt = site.rule.lineFt;
+  if (site.constraints) {
+    site.constraints.zoning = { zonedesc: zoning, fetchedAt: new Date().toISOString() };
+  }
+  if (!session.hadDraft && !site.accessory && site.lineFt === session.lineFtAtStart) {
+    site.lineFt = site.rule.lineFt;
+  }
   refreshOverlays(map);
 }
 
 export function exitSitePlan(map: MapLibreMap) {
+  persistDraft();
+  cancelConstraintOverlays();
   site.active = false;
+  site.draftPin = null;
+  site.planId = null;
+  site.serverRev = 0;
+  sessionParcel = null;
   site.parcel = null;
   site.geom = null;
   site.placeMode = null;
-  site.marks = [];
+  site.drawVertices = [];
+  site.view = "plan";
+  lastTapAt = 0;
+  lastTapPos = null;
+  clearZoomHold();
+  setDoubleClickZoom(map, true);
+  site.features = [];
+  site.selectedId = null;
+  site.constraints = null;
+  resetFormDefaults();
+  clearConstraintLayers(map);
   clearSiteLayers(map);
   for (const id of ["parcels-line", "parcels-fill-private", "parcels-fill-public", "parcels-label", "county-outline"]) {
     if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", "visible");
@@ -245,37 +1046,261 @@ export function exitSitePlan(map: MapLibreMap) {
 
 export function setLineSetback(map: MapLibreMap, feet: number) {
   site.lineFt = Math.max(0, feet);
+  schedulePersist();
   refreshOverlays(map);
 }
 
-export function addMark(kind: SiteKind, center: Position, extras: Partial<SiteMark> = {}) {
-  if (!site.geom || !pointInParcel(center, site.geom)) return null;
-  const id = `${kind}-${Date.now()}`;
-  const mark: SiteMark = {
-    id,
-    kind,
-    label:
-      extras.label ??
-      (kind === "structure" ? "Proposed structure" : kind === "well" ? "Well" : "Septic"),
-    center,
-    widthFt: extras.widthFt ?? (kind === "structure" ? 40 : undefined),
-    lengthFt: extras.lengthFt ?? (kind === "structure" ? 60 : undefined),
-    rotationDeg: extras.rotationDeg ?? 0,
-  };
-  site.marks.push(mark);
-  site.selectedId = id;
-  return mark;
+export function selectedFeature(): PlanFeature | undefined {
+  return site.features.find((f) => f.id === site.selectedId);
 }
 
-export function updateSelected(partial: Partial<SiteMark>) {
-  const mark = site.marks.find((m) => m.id === site.selectedId);
-  if (!mark) return;
-  Object.assign(mark, partial);
+export function addFeature(kind: PointKind, center: Position, extras: Partial<PlanFeature> = {}) {
+  if (!site.geom) return null;
+  if (kind !== "front_door" && !pointInParcel(center, site.geom)) return null;
+  const status = extras.status ?? site.status;
+  const id = extras.id ?? `${kind}-${Date.now()}`;
+  const feature: PlanFeature = {
+    id,
+    kind,
+    status,
+    label: extras.label ?? defaultLabel(kind, status),
+    geom: { type: "Point", coordinates: center },
+    onPacket: extras.onPacket ?? true,
+    props: {
+      ...(kind === "structure"
+        ? {
+            widthFt: site.widthFt,
+            lengthFt: site.lengthFt,
+            rotationDeg: site.rotationDeg,
+            eaveFt: site.eaveFt,
+          }
+        : {}),
+      source: "user",
+      ...extras.props,
+    },
+  };
+  site.features.push(feature);
+  site.selectedId = id;
+  schedulePersist();
+  return feature;
+}
+
+export function updateSelected(
+  partial: Partial<PlanFeature["props"]> & { status?: FeatureStatus; label?: string; onPacket?: boolean },
+) {
+  const feature = selectedFeature();
+  if (!feature) return;
+  if (partial.widthFt != null) feature.props.widthFt = partial.widthFt;
+  if (partial.lengthFt != null) feature.props.lengthFt = partial.lengthFt;
+  if (partial.rotationDeg != null) feature.props.rotationDeg = partial.rotationDeg;
+  if (partial.eaveFt != null) feature.props.eaveFt = partial.eaveFt;
+  if (partial.useClass != null) {
+    feature.props.useClass = parseUseClass(partial.useClass);
+    if (feature.kind === "use_area" && !partial.label) {
+      feature.label = defaultLabel(feature.kind, feature.status, feature.props.useClass);
+    }
+  }
+  if (partial.source != null) feature.props.source = partial.source;
+  if (partial.notes != null) feature.props.notes = partial.notes;
+  if (partial.onPacket != null) feature.onPacket = partial.onPacket;
+  if (partial.status) {
+    feature.status = partial.status;
+    feature.label = defaultLabel(feature.kind, feature.status, feature.props.useClass);
+  }
+  if (partial.label) feature.label = partial.label;
+  schedulePersist();
+}
+
+export function setView(map: MapLibreMap, view: PlanView) {
+  if (site.placeMode === "use_area" && view === "packet") return;
+  site.view = view;
+  refreshOverlays(map);
+}
+
+function featureVisible(feature: PlanFeature) {
+  if (site.view === "packet" && feature.kind === "use_area" && !feature.onPacket) return false;
+  return true;
 }
 
 export function removeSelected() {
-  site.marks = site.marks.filter((m) => m.id !== site.selectedId);
-  site.selectedId = site.marks.at(-1)?.id ?? null;
+  site.features = site.features.filter((f) => f.id !== site.selectedId);
+  site.selectedId = site.features.at(-1)?.id ?? null;
+  schedulePersist();
+}
+
+function pixelsApart(map: MapLibreMap, a: Position, b: Position) {
+  const pa = map.project(a as [number, number]);
+  const pb = map.project(b as [number, number]);
+  return Math.hypot(pa.x - pb.x, pa.y - pb.y);
+}
+
+function noteTap(lngLat: Position) {
+  lastTapAt = performance.now();
+  lastTapPos = lngLat;
+}
+
+function isDoubleTap(map: MapLibreMap, lngLat: Position) {
+  if (!lastTapPos || performance.now() - lastTapAt > DOUBLE_TAP_MS) return false;
+  return pixelsApart(map, lastTapPos, lngLat) <= DOUBLE_TAP_PX;
+}
+
+function clearZoomHold() {
+  window.clearTimeout(zoomHoldTimer);
+  zoomHoldTimer = 0;
+  zoomHoldUntil = 0;
+}
+
+function holdDrawZoom(map: MapLibreMap) {
+  setDoubleClickZoom(map, false);
+  zoomHoldUntil = performance.now() + DRAW_ZOOM_HOLD_MS;
+  window.clearTimeout(zoomHoldTimer);
+  zoomHoldTimer = window.setTimeout(() => {
+    zoomHoldTimer = 0;
+    zoomHoldUntil = 0;
+    if (!isDrawKind(site.placeMode)) setDoubleClickZoom(map, true);
+  }, DRAW_ZOOM_HOLD_MS);
+}
+
+function closedRing(verts: Position[]): Position[] {
+  const ring = verts.map((v) => [v[0], v[1]] as Position);
+  const first = ring[0];
+  const last = ring[ring.length - 1];
+  if (!first || !last) return ring;
+  if (first[0] !== last[0] || first[1] !== last[1]) ring.push([first[0], first[1]]);
+  return ring;
+}
+
+function stripTailDuplicate(verts: Position[]) {
+  if (verts.length < 2) return verts;
+  const a = verts[verts.length - 2];
+  const b = verts[verts.length - 1];
+  if (feetBetween(a, b) < 2) return verts.slice(0, -1);
+  return verts;
+}
+
+export function setPlaceMode(map: MapLibreMap, mode: PlaceMode) {
+  site.placeMode = mode;
+  site.drawVertices = [];
+  lastTapAt = 0;
+  lastTapPos = null;
+  if (isDrawKind(mode)) setDoubleClickZoom(map, false);
+  else if (performance.now() >= zoomHoldUntil) setDoubleClickZoom(map, true);
+  refreshDrawPreview(map);
+}
+
+export function finishDrawing(map: MapLibreMap): PlanFeature | null {
+  const kind = site.placeMode;
+  if (!isDrawKind(kind)) return null;
+  const verts = stripTailDuplicate(site.drawVertices);
+  if (verts.length < minDrawVertices(kind)) return null;
+
+  const status = site.status;
+  const geom: Geometry =
+    kind === "driveway"
+      ? { type: "LineString", coordinates: verts }
+      : { type: "Polygon", coordinates: [closedRing(verts)] };
+
+  const useClass = kind === "use_area" ? site.useClass : undefined;
+  const feature: PlanFeature = {
+    id: `${kind}-${Date.now()}`,
+    kind,
+    status,
+    label: defaultLabel(kind, status, useClass),
+    geom,
+    onPacket: kind !== "use_area",
+    props: { source: "user", ...(useClass ? { useClass } : {}) },
+  };
+  site.features.push(feature);
+  site.selectedId = feature.id;
+  site.placeMode = null;
+  site.drawVertices = [];
+  lastTapAt = 0;
+  lastTapPos = null;
+  holdDrawZoom(map);
+  schedulePersist();
+  refreshOverlays(map);
+  return feature;
+}
+
+export function addDrawVertex(map: MapLibreMap, lngLat: Position): "vertex" | "finished" | "rejected" {
+  const kind = site.placeMode;
+  if (!isDrawKind(kind)) return "rejected";
+  const min = minDrawVertices(kind);
+  const doubled = isDoubleTap(map, lngLat);
+  const last = site.drawVertices.at(-1);
+  const closeToLast = last != null && pixelsApart(map, last, lngLat) <= DOUBLE_TAP_PX;
+
+  if (doubled) {
+    // First click of the pair already committed a vertex; drop it if we already had enough.
+    if (last && lastTapPos && pixelsApart(map, last, lastTapPos) <= DOUBLE_TAP_PX && site.drawVertices.length - 1 >= min) {
+      site.drawVertices.pop();
+    }
+    lastTapAt = 0;
+    lastTapPos = null;
+    if (stripTailDuplicate(site.drawVertices).length >= min) {
+      return finishDrawing(map) ? "finished" : "vertex";
+    }
+    refreshDrawPreview(map);
+    return "vertex";
+  }
+
+  if (closeToLast) {
+    if (stripTailDuplicate(site.drawVertices).length >= min) {
+      return finishDrawing(map) ? "finished" : "vertex";
+    }
+    noteTap(lngLat);
+    refreshDrawPreview(map);
+    return "vertex";
+  }
+
+  const allowOffParcel = kind === "driveway" || kind === "easement";
+  if (!allowOffParcel && site.geom && !pointInParcel(lngLat, site.geom)) return "rejected";
+
+  site.drawVertices.push([lngLat[0], lngLat[1]]);
+  noteTap(lngLat);
+  setDoubleClickZoom(map, false);
+  refreshDrawPreview(map);
+  return "vertex";
+}
+
+function mapProps(feature: PlanFeature) {
+  return {
+    id: feature.id,
+    kind: feature.kind,
+    status: feature.status,
+    selected: feature.id === site.selectedId,
+    label: feature.label,
+    useClass: parseUseClass(feature.props.useClass),
+  };
+}
+
+function refreshDrawPreview(map: MapLibreMap) {
+  const verts = site.drawVertices;
+  const kind = site.placeMode;
+  const features: Feature[] = [];
+  if (verts.length >= 2) {
+    if (isDrawKind(kind) && kind !== "driveway" && verts.length >= 3) {
+      features.push({
+        type: "Feature",
+        properties: { kind: "fill" },
+        geometry: { type: "Polygon", coordinates: [closedRing(verts)] },
+      });
+    } else {
+      features.push({
+        type: "Feature",
+        properties: { kind: "line" },
+        geometry: { type: "LineString", coordinates: verts },
+      });
+    }
+  }
+  for (const v of verts) {
+    features.push({
+      type: "Feature",
+      properties: { kind: "vertex" },
+      geometry: { type: "Point", coordinates: v },
+    });
+  }
+  setSrc(map, "site-draw", { type: "FeatureCollection", features });
 }
 
 export function refreshOverlays(map: MapLibreMap) {
@@ -286,25 +1311,19 @@ export function refreshOverlays(map: MapLibreMap) {
     features: setback ? [setback] : [],
   });
 
-  const structure = site.marks.find((m) => m.kind === "structure");
-  const structurePoly =
-    structure && structure.widthFt && structure.lengthFt
-      ? rectanglePolygon(
-          structure.center,
-          structure.widthFt,
-          structure.lengthFt,
-          structure.rotationDeg ?? 0,
-        )
-      : null;
+  const structures = site.features.filter((f) => f.kind === "structure");
+  const measured =
+    structures.find((f) => f.id === site.selectedId) ?? structures[0];
+  const measuredEnv = measured ? structureEnvelope(measured) : null;
 
   const edges = parcelEdges(site.geom);
   setSrc(map, "site-edges", {
     type: "FeatureCollection",
     features: edges.map((edge) => {
       let label = `${formatFeet(edge.lengthFt)} ${compass(edge.bearing)}`;
-      if (structurePoly) {
-        const toBldg = minDistToEdgeFt(structurePoly, edge);
-        label = `${formatFeet(edge.lengthFt)} · ${formatFeet(toBldg)} to bldg`;
+      if (measuredEnv) {
+        const toBldg = minDistToEdgeFt(measuredEnv, edge);
+        label = `${formatFeet(edge.lengthFt)} · ${formatFeet(toBldg)} to projection`;
       }
       return {
         type: "Feature" as const,
@@ -314,58 +1333,228 @@ export function refreshOverlays(map: MapLibreMap) {
     }),
   });
 
+  setSrc(map, "site-envelope", {
+    type: "FeatureCollection",
+    features: structures.flatMap((feature) => {
+      if (structureEaveFt(feature) <= 0) return [];
+      const env = structureEnvelope(feature);
+      if (!env) return [];
+      return [
+        {
+          ...env,
+          properties: {
+            id: feature.id,
+            status: feature.status,
+            selected: feature.id === site.selectedId,
+          },
+        },
+      ];
+    }),
+  });
+
   setSrc(map, "site-structure", {
     type: "FeatureCollection",
-    features: structurePoly
-      ? [
-          {
-            ...structurePoly,
-            properties: {
-              label: `${structure?.label ?? "Structure"} ${structure?.widthFt}×${structure?.lengthFt} ft`,
-            },
+    features: structures.flatMap((feature) => {
+      const poly = structurePoly(feature);
+      if (!poly) return [];
+      return [
+        {
+          ...poly,
+          properties: {
+            id: feature.id,
+            status: feature.status,
+            selected: feature.id === site.selectedId,
+            label: `${feature.label} ${feature.props.widthFt}×${feature.props.lengthFt} ft`,
           },
-        ]
-      : [],
+        },
+      ];
+    }),
   });
 
   setSrc(map, "site-points", {
     type: "FeatureCollection",
-    features: site.marks
-      .filter((m) => m.kind !== "structure")
-      .map(
-        (m): Feature<Point> => ({
-          type: "Feature",
-          properties: { kind: m.kind, label: m.label },
-          geometry: { type: "Point", coordinates: m.center },
-        }),
-      ),
+    features: site.features
+      .filter((f) => f.kind === "well" || f.kind === "septic" || f.kind === "front_door")
+      .flatMap((f): Feature<Point>[] => {
+        const center = featureCenter(f);
+        if (!center) return [];
+        return [
+          {
+            type: "Feature",
+            properties: mapProps(f),
+            geometry: { type: "Point", coordinates: center },
+          },
+        ];
+      }),
   });
+
+  setSrc(map, "site-driveway", {
+    type: "FeatureCollection",
+    features: site.features.flatMap((f): Feature<LineString>[] => {
+      if (f.kind !== "driveway" || f.geom.type !== "LineString") return [];
+      return [{ type: "Feature", properties: mapProps(f), geometry: f.geom }];
+    }),
+  });
+
+  setSrc(map, "site-leach", {
+    type: "FeatureCollection",
+    features: site.features.flatMap((f): Feature<Polygon>[] => {
+      if (f.kind !== "leach" || f.geom.type !== "Polygon") return [];
+      return [{ type: "Feature", properties: mapProps(f), geometry: f.geom }];
+    }),
+  });
+
+  setSrc(map, "site-easement", {
+    type: "FeatureCollection",
+    features: site.features.flatMap((f): Feature<Polygon | LineString>[] => {
+      if (f.kind !== "easement") return [];
+      if (f.geom.type === "Polygon" || f.geom.type === "LineString") {
+        return [{ type: "Feature", properties: mapProps(f), geometry: f.geom }];
+      }
+      return [];
+    }),
+  });
+
+  setSrc(map, "site-use-area", {
+    type: "FeatureCollection",
+    features: site.features.flatMap((f): Feature<Polygon>[] => {
+      if (f.kind !== "use_area" || f.geom.type !== "Polygon" || !featureVisible(f)) return [];
+      return [{ type: "Feature", properties: mapProps(f), geometry: f.geom }];
+    }),
+  });
+
+  refreshDrawPreview(map);
 }
 
-export function handleSiteClick(map: MapLibreMap, lngLat: Position) {
-  if (!site.active || !site.placeMode) return false;
-  const mark = addMark(site.placeMode, lngLat);
-  site.placeMode = null;
-  if (mark) refreshOverlays(map);
-  return true;
+function pickFeatureAt(lngLat: Position): PlanFeature | null {
+  let bestPoint: PlanFeature | null = null;
+  let bestFt = Infinity;
+  for (const feature of site.features) {
+    if (feature.geom.type !== "Point") continue;
+    const dist = feetBetween(feature.geom.coordinates, lngLat);
+    if (dist < bestFt) {
+      bestFt = dist;
+      bestPoint = feature;
+    }
+  }
+  if (bestPoint && bestFt <= DOOR_SNAP_FT) return bestPoint;
+
+  for (let i = site.features.length - 1; i >= 0; i--) {
+    const feature = site.features[i];
+    if (feature.kind === "structure") {
+      const poly = structurePoly(feature);
+      if (poly && pointInParcel(lngLat, poly.geometry)) return feature;
+    }
+    if (
+      (feature.kind === "leach" || feature.kind === "easement") &&
+      feature.geom.type === "Polygon" &&
+      pointInParcel(lngLat, feature.geom)
+    ) {
+      return feature;
+    }
+  }
+  let best: PlanFeature | null = null;
+  let bestLine = 25;
+  for (const feature of site.features) {
+    if (feature.kind === "structure") continue;
+    if (feature.geom.type === "Polygon") continue;
+    if (feature.geom.type === "Point") {
+      const dist = feetBetween(feature.geom.coordinates, lngLat);
+      if (dist < bestLine) {
+        bestLine = dist;
+        best = feature;
+      }
+    } else if (feature.geom.type === "LineString") {
+      const dist = minDistToLineFt(lngLat, feature.geom.coordinates);
+      if (dist < bestLine) {
+        bestLine = dist;
+        best = feature;
+      }
+    }
+  }
+  if (best) return best;
+  for (let i = site.features.length - 1; i >= 0; i--) {
+    const feature = site.features[i];
+    if (feature.kind !== "use_area" || feature.geom.type !== "Polygon") continue;
+    if (!featureVisible(feature)) continue;
+    if (pointInParcel(lngLat, feature.geom)) return feature;
+  }
+  return null;
 }
 
-export function distanceSummary() {
+function placeFrontDoor(lngLat: Position) {
+  const structures = site.features.filter((f) => f.kind === "structure");
+  const target = structures.find((f) => f.id === site.selectedId) ?? structures[0];
+  const envelope = target ? structureEnvelope(target) : null;
+  if (!envelope) return null;
+  const snap = nearestOnPolygonFt(lngLat, envelope);
+  if (!Number.isFinite(snap.distFt) || snap.distFt > DOOR_SNAP_FT) return null;
+  return addFeature("front_door", snap.point, { label: "Front door" });
+}
+
+export type SiteClickResult = false | "vertex" | "finished" | "rejected" | "placed" | "selected";
+
+export function handleSiteClick(map: MapLibreMap, lngLat: Position): SiteClickResult {
+  if (!site.active) return false;
+  if (isDrawKind(site.placeMode)) return addDrawVertex(map, lngLat);
+  if (site.placeMode === "front_door") {
+    const feature = placeFrontDoor(lngLat);
+    if (!feature) {
+      const el = document.getElementById("status");
+      if (el) el.textContent = DOOR_REJECT_MSG;
+      return "rejected";
+    }
+    site.placeMode = null;
+    refreshOverlays(map);
+    return "placed";
+  }
+  if (isPointKind(site.placeMode)) {
+    const feature = addFeature(site.placeMode, lngLat);
+    site.placeMode = null;
+    if (feature) refreshOverlays(map);
+    return "placed";
+  }
+  const hit = pickFeatureAt(lngLat);
+  if (!hit) return false;
+  site.selectedId = hit.id;
+  site.status = hit.status;
+  if (hit.kind === "use_area") site.useClass = parseUseClass(hit.props.useClass);
+  refreshOverlays(map);
+  return "selected";
+}
+
+export interface DistanceRow {
+  structureId: string;
+  structureLabel: string;
+  eaveFt: number;
+  side: string;
+  lotFt: number;
+  toBldgFt: number;
+}
+
+/** Envelope → every outer-ring lot edge. Packet uses `{ all: true }`; inspector uses selected. */
+export function distanceSummary(opts?: { structureId?: string; all?: boolean }): DistanceRow[] {
   if (!site.geom) return [];
-  const structure = site.marks.find((m) => m.kind === "structure");
-  if (!structure?.widthFt || !structure.lengthFt) return [];
-  const poly = rectanglePolygon(
-    structure.center,
-    structure.widthFt,
-    structure.lengthFt,
-    structure.rotationDeg ?? 0,
-  );
-  return parcelEdges(site.geom)
-    .filter((e) => e.lengthFt >= 15)
-    .map((edge) => ({
-      side: compass(edge.bearing + 90),
-      lotFt: edge.lengthFt,
-      toBldgFt: minDistToEdgeFt(poly, edge),
-    }))
-    .sort((a, b) => a.toBldgFt - b.toBldgFt);
+  const structures = site.features.filter((f) => f.kind === "structure");
+  const wantedId = opts?.structureId ?? site.selectedId;
+  const selectedStruct = structures.find((f) => f.id === wantedId);
+  const targets = opts?.all ? structures : selectedStruct ? [selectedStruct] : structures.slice(0, 1);
+  const edges = parcelEdges(site.geom);
+  const rows: DistanceRow[] = [];
+  for (const structure of targets) {
+    const envelope = structureEnvelope(structure);
+    if (!envelope) continue;
+    const chunk = edges
+      .map((edge) => ({
+        structureId: structure.id,
+        structureLabel: structure.label,
+        eaveFt: structureEaveFt(structure),
+        side: compass(edge.bearing + 90),
+        lotFt: edge.lengthFt,
+        toBldgFt: minDistToEdgeFt(envelope, edge),
+      }))
+      .sort((a, b) => a.toBldgFt - b.toBldgFt);
+    rows.push(...chunk);
+  }
+  return rows;
 }

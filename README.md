@@ -2,7 +2,7 @@
 
 Phone map of **Bonner County, Idaho** property lines. Looks like a one-county onX: red private parcels, tinted public land, GPS, search, and an offline pack.
 
-Parcel geometry and owner names come from the [Bonner County GIS public cadastral service](https://cloudgis.bonnercountyid.gov/server/rest/services/Map_Services/Cadastral_Public/MapServer). That is the same assessor source onX uses. It is **not a survey**.
+Parcel geometry and owner names come from the [Bonner County GIS public cadastral service](https://cloudgis.bonnercountyid.gov/server/rest/services/Map_Services/Cadastral_Public/MapServer). That is the same assessor source onX uses. It is **not a survey** and **not a filing**. The app does not submit a Building Location Permit.
 
 ## Use it on your phone
 
@@ -10,8 +10,18 @@ Parcel geometry and owner names come from the [Bonner County GIS public cadastra
 cd bonner-map
 npm install
 npm run data      # downloads 45k+ parcels from the county GIS service
-npm run dev       # serves on your LAN
+npm run dev       # serves on your LAN (proxies /api to :3000)
 ```
+
+The public map does not need the API. To run it locally too:
+
+```bash
+cd api
+npm install
+npm run dev       # Hono on :3000, SQLite at ./data/bonner.sqlite
+```
+
+Or `DATABASE_PATH=/tmp/bonner.sqlite node dist/index.js` after `npm run build`. Vite’s `/api` proxy targets `http://127.0.0.1:3000`.
 
 On the same Wi‑Fi, open the printed URL (something like `http://192.168.x.x:5173`). On iPhone, Share → **Add to Home Screen**. Open Layers and tap **Save county for offline** before you leave cell coverage, then switch the basemap to **Streets / topo**.
 
@@ -30,43 +40,89 @@ iOS only allows GPS in a home-screen web app or over HTTPS. If the blue dot is b
 - Offline pack: parcels, addresses, and USGS topo tiles for the whole county (satellite still needs cell)
 - **BLP site map:** select a parcel → **Make BLP site map** → place the proposed structure, well, and septic → print or save PDF
 
-Bonner County Building Location Permits (BCRC 11-105) need a site plan showing the structure and distances from its greatest projections to every property line, plus environmental features. This draft map is a starting point for that drawing — not a survey and not the official application.
+Bonner County Building Location Permits (BCRC 11-105) need a site plan showing the structure and distances from its greatest projections to every property line, plus environmental features. This draft map is a starting point for that drawing — **not a survey and not a filing**. Official application: [bonnercountyid.gov/building-location-permit](https://www.bonnercountyid.gov/building-location-permit).
+
+Constraint overlays (flood, wetlands, roads, ROW, NHD) are geometrically clipped to the parcel plus 300 ft. NWI is inventory, not a delineation. FEMA NFHL is not a floodplain development permit. The **wetland 40 ft** dashed overlay is advisory — **verify current BCRC 12-733 / Title 12 with Planning** at implement time (historical table used 40 ft). **Fire-district sign-off** is a county checklist item; do not treat in-app copy as a pause/resume status — **verify the current process on the county [Fire District Sign Off](https://www.bonnercountyid.gov/building-location-permit) page**.
 
 ## Deploy on Dokploy (Hostinger VPS)
 
-This app is a static PWA. The Docker image builds it, pulls the latest county parcels if they are not already in the tree, and serves on **port 80** behind Dokploy’s HTTPS proxy.
+This is a Compose app: nginx serves the static PWA on **port 80**, a Node API holds SQLite on a named volume, and a sidecar writes backups. Dokploy’s HTTPS proxy still terminates TLS in front of the web container.
+
+**Cutover:** stop using **Build Type: Dockerfile** for this app. Create or convert to a **Compose** application pointing at `docker-compose.yml`. The public map does not wait on API health.
 
 ### 1. Put the code on Git
 
-Dokploy pulls from Git. The data files are gitignored (~36 MB), so the image runs `npm run data` during the build and talks to Bonner County GIS. The VPS needs outbound HTTPS.
+Dokploy pulls from Git. The data files are gitignored (~36 MB), so the **web** image runs `npm run data` during the build and talks to Bonner County GIS. The VPS needs outbound HTTPS.
 
 If this folder lives inside a larger repo, set **Root Directory** to `bonner-map`.
 
-### 2. Create the application
+### 2. Create the application (Compose, not Dockerfile)
 
 In Dokploy:
 
 1. **Create project** → **Create application** → Git provider (or raw Git URL).
-2. **Build Type:** Dockerfile
-3. **Dockerfile path:** `./Dockerfile` (relative to the root directory above)
-4. **Port:** `80`
-5. Do **not** publish a host port. Dokploy’s Traefik/Caddy reaches the container on 80.
-6. Add a domain → enable HTTPS / Let’s Encrypt.
-7. Deploy.
+2. **Build Type:** Compose — **not** Dockerfile.
+3. **Compose file:** `docker-compose.yml` (relative to the root directory above).
+4. **Port:** `80` (the `web` service). Do **not** publish a host port. Dokploy’s Traefik/Caddy reaches the web container on 80.
+5. Add a domain → enable HTTPS / Let’s Encrypt.
+6. Env on the Compose **api** service (Dokploy UI, not git):
+   - `APP_ORIGIN=https://your-domain` (full origin; production requires `https:`)
+   - SMTP for OTP (required when `NODE_ENV=production` on the **API** container only):
+     `SMTP_HOST`, `SMTP_PORT` (default 587), `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`
+   - Hostinger SMTP from this VPS is **unverified**. Pick a mailbox or a transactional relay before production sign-in.
+7. Deploy. The **web** image still serves `/` if SMTP is missing; only the API process refuses to boot.
 
-Compose works the same: point a Compose service at `docker-compose.yml`. Still attach the domain in the UI.
+Named volumes:
+
+- **`plan-data`** — live SQLite (`/data/bonner.sqlite`) and uploads. This is the app volume.
+- **`plan-backups`** — nightly `sqlite3 .backup` plus a tar of uploads. A different volume so a `plan-data` recreate does not wipe every copy.
+
+Same-volume `.backup` on `plan-data` (`/data/backups/`) is only a **SQLite corruption hedge**. It dies if `plan-data` is dropped. Two Docker volumes on one VPS also die together on a disk wipe. **Off-box copy is required** for VPS-rebuild recovery: weekly `docker cp` of `plan-backups`, or a Hostinger/Dokploy snapshot. **Dokploy named-volume retention and Hostinger snapshot behavior are unverified.** Same-volume `.backup` ≠ VPS-rebuild recovery.
+
+If the API container is down, nginx still serves `/` and `/data/`. `/api/` is 502. The public county map keeps working.
+
+### Operator: delete a user
+
+No self-serve account deletion. Capture the user id **before** the `DELETE FROM users` row.
+
+```sql
+-- :email is the account to erase. One transaction; save :uid from SELECT before COMMIT.
+BEGIN;
+SELECT id FROM users WHERE email = :email COLLATE NOCASE;
+DELETE FROM attachments WHERE plan_id IN (
+  SELECT id FROM plans WHERE user_id = :uid);
+DELETE FROM plans WHERE user_id = :uid;
+DELETE FROM sessions WHERE user_id = :uid;
+DELETE FROM webauthn_credentials WHERE user_id = :uid;
+DELETE FROM otp_codes WHERE email = :email COLLATE NOCASE;
+DELETE FROM auth_events WHERE key = 'email:' || lower(:email);
+DELETE FROM users WHERE id = :uid;
+COMMIT;
+```
+
+Live `auth_events` keys are exactly `email:${normalized}` (and unrelated `ip:…` counters). Do **not** `LIKE 'email:' || :email || '%'` — `a@b.c` would match `email:a@b.com`.
+
+Then `rm -rf /data/uploads/{uid}` using the **selected** id. This branch has no upload writer. Design layout for PR 10 is `/data/uploads/{userId}/{id}`; **confirm `attachments.disk_path` is under that prefix** before running `rm` once uploads exist. Treat `plan-data` as sensitive (email, session hashes, uploaded deeds).
 
 ### 3. After it is live
 
 Open `https://your-domain` on the phone. iOS GPS and “Add to Home Screen” need that HTTPS. Tap **Save county for offline**, then switch the basemap to **Streets / topo**.
 
-Rebuild the app in Dokploy whenever you want a fresh parcel snapshot (county updates daily).
+Rebuild the app in Dokploy whenever you want a fresh parcel snapshot (county updates daily). Claimed plans live on `plan-data` and are not replaced by a web image rebuild.
 
 ### Local image check
+
+Web-only (no API):
 
 ```bash
 npm run docker:build
 npm run docker:run    # http://localhost:8080
+```
+
+Full stack (Dokploy-shaped; still no host port 80 — use `docker compose run` / exec, or add a temporary port mapping yourself):
+
+```bash
+docker compose up --build
 ```
 
 ## Refresh the data
@@ -74,6 +130,12 @@ npm run docker:run    # http://localhost:8080
 County parcels update daily. Re-run `npm run data` whenever you want a new snapshot, or redeploy the Docker image so the build fetches a new one.
 
 ## Legal
+
+Assessor map, **not a survey**. Lines can be off by many feet. Do not use this to set a fence or decide a property dispute. Distances are approximate. NWI wetlands are inventory, not a delineation. FEMA NFHL is not a floodplain development permit. This app **does not file** a Building Location Permit.
+
+Wetland **40 ft** overlay: advisory — **verify** current [BCRC 12-733](https://codelibrary.amlegal.com/codes/bonnercountyid/latest/bonnercounty_id/0-0-0-4080) / Title 12 with Planning (historical table used 40 ft; do not treat 40 ft as confirmed ordinance text without checking).
+
+Fire-district sign-off: **verify on the county site** at implement time. A Fire District Sign Off packet is linked from the [BLP page](https://www.bonnercountyid.gov/building-location-permit); do not bake “districts paused” (or any pause/resume status) into the app as fact.
 
 Bonner County: maps are for reference only and are not a substitute for a legal survey or official records. Do not set a fence from this app. Do not sell the county’s Field Maps package.
 
