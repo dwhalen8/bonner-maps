@@ -1,11 +1,14 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { mkdirSync } from "node:fs";
+import { assertMailerForProduction, mountAuth } from "./auth";
 import { migrate, metrics, openDatabase } from "./db";
 
 const DATABASE_PATH = process.env.DATABASE_PATH ?? "./data/bonner.sqlite";
 const UPLOAD_DIR = process.env.UPLOAD_DIR ?? "./data/uploads";
 const PORT = Number(process.env.PORT ?? 3000) || 3000;
+
+assertMailerForProduction();
 
 mkdirSync(UPLOAD_DIR, { recursive: true });
 
@@ -48,6 +51,8 @@ api.get("/healthz", (c) => {
     );
   }
 });
+
+mountAuth(api, db);
 
 const app = new Hono();
 app.route("/api", api);

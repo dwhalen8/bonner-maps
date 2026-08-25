@@ -32,6 +32,37 @@ body { background: var(--bg); color: var(--ink); overflow: hidden; }
 }
 .chrome > * { pointer-events: auto; }
 .chrome.top { top: var(--safe-top); }
+.header-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.header-actions .ghost { height: 40px; font-size: 13px; }
+#signed-in {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 0 4px 0 10px;
+  backdrop-filter: blur(12px);
+}
+#signed-in[hidden] { display: none; }
+#signed-email {
+  font-size: 12px;
+  color: var(--muted);
+  max-width: 28vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sheet.auth { max-height: none; }
+.sheet.auth .primary { margin-top: 8px; }
+.sheet.auth .check { margin-top: 12px; }
+@media (display-mode: standalone) {
+  #auth-link-wrap { display: none !important; }
+}
 .chrome.bottom {
   bottom: var(--safe-bottom);
   justify-content: center;
@@ -213,6 +244,7 @@ dd { margin: 2px 0 0; }
 .sheet .row label, .sheet label { font-size: 12px; color: var(--muted); }
 .sheet input[type="text"],
 .sheet input[type="number"],
+.sheet input[type="email"],
 .sheet textarea {
   width: 100%;
   margin-top: 4px;

@@ -3,6 +3,7 @@ import "./style.css";
 import type { Map as MapLibreMap } from "maplibre-gl";
 import type { DataMeta, ParcelProps } from "./types";
 import { LAND_LABELS } from "./types";
+import { logout, me, requestOtp, verifyOtp, type Me } from "./auth";
 import {
   addDataLayers,
   addLocationDot,
@@ -13,6 +14,7 @@ import {
   queryParcelFeature,
   setBasemap,
   setLayerVisible,
+  stripLoginQuery,
   updateLocation,
   type BasemapId,
 } from "./map";
@@ -402,8 +404,106 @@ async function loadMeta() {
   }
 }
 
+function isStandalonePwa(): boolean {
+  return (
+    window.matchMedia("(display-mode: standalone)").matches ||
+    window.matchMedia("(display-mode: fullscreen)").matches ||
+    Boolean((navigator as Navigator & { standalone?: boolean }).standalone)
+  );
+}
+
+function renderAuth(user: Me | null) {
+  $("signin-btn").hidden = Boolean(user);
+  $("signed-in").hidden = !user;
+  $("auth-panel").hidden = true;
+  if (user) $("signed-email").textContent = user.email;
+}
+
+async function refreshSession() {
+  const user = await me();
+  renderAuth(user);
+  if (sessionStorage.getItem("loginOk")) sessionStorage.removeItem("loginOk");
+}
+
+function bindAuthChrome() {
+  const panel = $("auth-panel");
+  const status = $("auth-status");
+  const emailInput = $<HTMLInputElement>("auth-email");
+  const codeInput = $<HTMLInputElement>("auth-code");
+  const sendBtn = $<HTMLButtonElement>("auth-send");
+  const verifyBtn = $<HTMLButtonElement>("auth-verify");
+  const linkWrap = $("auth-link-wrap");
+  const standalone = isStandalonePwa();
+  if (!standalone) linkWrap.hidden = false;
+
+  const includeLink = () =>
+    !standalone && $<HTMLInputElement>("auth-include-link").checked;
+
+  $("signin-btn").addEventListener("click", () => {
+    panel.hidden = !panel.hidden;
+  });
+  $("close-auth").addEventListener("click", () => {
+    panel.hidden = true;
+  });
+
+  async function sendCode() {
+    const email = emailInput.value.trim();
+    if (!email) {
+      status.textContent = "Enter your email.";
+      return;
+    }
+    sendBtn.disabled = true;
+    status.textContent = "Sending code…";
+    try {
+      await requestOtp(email, includeLink() || undefined);
+      status.textContent = "Code sent. Check email and type it here.";
+      codeInput.focus();
+    } catch (err) {
+      status.textContent = err instanceof Error ? err.message : "Could not send code.";
+    } finally {
+      sendBtn.disabled = false;
+    }
+  }
+
+  async function doVerify() {
+    const email = emailInput.value.trim();
+    const code = codeInput.value.trim();
+    if (!email || !code) {
+      status.textContent = "Email and code required.";
+      return;
+    }
+    verifyBtn.disabled = true;
+    status.textContent = "Verifying…";
+    try {
+      await verifyOtp(email, code);
+      status.textContent = "";
+      await refreshSession();
+    } catch (err) {
+      status.textContent = err instanceof Error ? err.message : "Could not verify.";
+    } finally {
+      verifyBtn.disabled = false;
+    }
+  }
+
+  $("auth-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (codeInput.value.trim()) void doVerify();
+    else void sendCode();
+  });
+  sendBtn.addEventListener("click", () => void sendCode());
+  verifyBtn.addEventListener("click", () => void doVerify());
+
+  $("signout-btn").addEventListener("click", async () => {
+    await logout();
+    renderAuth(null);
+  });
+}
+
 async function boot() {
+  stripLoginQuery();
   const map = createMap($("map"));
+  bindAuthChrome();
+  void refreshSession();
   bindInstall();
   bindOffline();
   void refreshOfflineLabel();
