@@ -121,7 +121,10 @@ function fillPrintBlock() {
     .filter(Boolean)
     .join("  ·  ");
   $("print-measures").textContent = distanceSummary({ all: true })
-    .map((row) => `${row.structureLabel} · ${row.side}: ${formatFeet(row.toBldgFt)} to projection`)
+    .map(
+      (row) =>
+        `${row.structureLabel} (eave ${formatFeet(row.eaveFt)}) · ${row.side}: ${formatFeet(row.toBldgFt)} to projection`,
+    )
     .join("   ");
   $("print-notes").textContent = site.notes;
 }

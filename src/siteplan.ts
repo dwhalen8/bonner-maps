@@ -548,7 +548,7 @@ export function refreshOverlays(map: MapLibreMap) {
       let label = `${formatFeet(edge.lengthFt)} ${compass(edge.bearing)}`;
       if (measuredEnv) {
         const toBldg = minDistToEdgeFt(measuredEnv, edge);
-        label = `${formatFeet(edge.lengthFt)} · ${formatFeet(toBldg)} to bldg`;
+        label = `${formatFeet(edge.lengthFt)} · ${formatFeet(toBldg)} to projection`;
       }
       return {
         type: "Feature" as const,
@@ -621,14 +621,8 @@ export function refreshOverlays(map: MapLibreMap) {
 }
 
 function pickFeatureAt(lngLat: Position): PlanFeature | null {
-  for (let i = site.features.length - 1; i >= 0; i--) {
-    const feature = site.features[i];
-    if (feature.kind !== "structure") continue;
-    const poly = structureEnvelope(feature) ?? structurePoly(feature);
-    if (poly && pointInParcel(lngLat, poly.geometry)) return feature;
-  }
-  let best: PlanFeature | null = null;
-  let bestFt = 25;
+  let bestPoint: PlanFeature | null = null;
+  let bestFt = Infinity;
   for (const feature of site.features) {
     if (feature.kind === "structure") continue;
     const center = featureCenter(feature);
@@ -636,10 +630,21 @@ function pickFeatureAt(lngLat: Position): PlanFeature | null {
     const dist = feetBetween(center, lngLat);
     if (dist < bestFt) {
       bestFt = dist;
-      best = feature;
+      bestPoint = feature;
     }
   }
-  return best;
+  // Door sits on the eave envelope; prefer a nearby point so Delete removes the door.
+  if (bestPoint && bestFt <= DOOR_SNAP_FT) return bestPoint;
+
+  for (let i = site.features.length - 1; i >= 0; i--) {
+    const feature = site.features[i];
+    if (feature.kind !== "structure") continue;
+    const poly = structurePoly(feature);
+    if (poly && pointInParcel(lngLat, poly.geometry)) return feature;
+  }
+
+  if (bestPoint && bestFt < 25) return bestPoint;
+  return null;
 }
 
 function placeFrontDoor(lngLat: Position) {
@@ -682,6 +687,7 @@ export function handleSiteClick(map: MapLibreMap, lngLat: Position) {
 export interface DistanceRow {
   structureId: string;
   structureLabel: string;
+  eaveFt: number;
   side: string;
   lotFt: number;
   toBldgFt: number;
@@ -703,6 +709,7 @@ export function distanceSummary(opts?: { structureId?: string; all?: boolean }):
       .map((edge) => ({
         structureId: structure.id,
         structureLabel: structure.label,
+        eaveFt: structureEaveFt(structure),
         side: compass(edge.bearing + 90),
         lotFt: edge.lengthFt,
         toBldgFt: minDistToEdgeFt(envelope, edge),
