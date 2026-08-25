@@ -1,6 +1,7 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { mkdirSync } from "node:fs";
+import { mountAttachments } from "./attachments";
 import { assertMailerForProduction, mountAuth } from "./auth";
 import { migrate, metrics, openDatabase } from "./db";
 import { mountPlans } from "./plans";
@@ -55,6 +56,7 @@ api.get("/healthz", (c) => {
 
 mountAuth(api, db);
 mountPlans(api, db);
+mountAttachments(api, db, UPLOAD_DIR);
 
 const app = new Hono();
 app.route("/api", api);

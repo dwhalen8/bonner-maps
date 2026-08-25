@@ -230,6 +230,27 @@
           <input id="print-letter" type="checkbox" /> Print on Letter (8.5×11)
         </label>
         <button id="print-sitemap" class="primary">Print / save PDF</button>
+        <div id="attachment-panel" hidden>
+          <p class="hint">Floor plans, elevations, and the deed are uploads — print the map from this screen.</p>
+          <div class="row">
+            <label>Kind
+              <select id="att-kind">
+                <option value="floor_plan">Floor plan</option>
+                <option value="elevation">Elevation</option>
+                <option value="deed">Deed</option>
+                <option value="fire_signoff">Fire sign-off</option>
+                <option value="other">Other</option>
+              </select>
+            </label>
+          </div>
+          <input id="att-file" type="file" accept=".pdf,.jpg,.jpeg,.png,.heic,.heif,application/pdf,image/*" />
+          <div class="btn-row">
+            <button id="att-upload" type="button" class="ghost">Upload</button>
+            <button id="att-zip" type="button" class="ghost">Download attachments and checklist</button>
+          </div>
+          <p class="hint">County portal prefers PDF or JPEG. In Photos, Share → Export as JPEG if this upload is HEIC.</p>
+          <ul id="att-list" class="measures"></ul>
+        </div>
         <p class="hint" id="print-hint">
           On iPhone: Print → Paper Size → Tabloid / 11×17 if you want that sheet. Letter still works; use the labeled distances.
         </p>

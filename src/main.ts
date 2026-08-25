@@ -68,6 +68,13 @@ import {
   type SiteKind,
 } from "./siteplan";
 import { formatFeet } from "./geo";
+import {
+  deleteAttachment,
+  downloadAttachmentsZip,
+  listAttachments,
+  uploadAttachment,
+  type AttachmentKind,
+} from "./attachments";
 import { PRINT_IOS_HINT, renderPrintBlock } from "./packet";
 import type { Polygon, MultiPolygon } from "geojson";
 import { findByPin, loadSearchIndex, searchParcels } from "./search";
@@ -261,6 +268,7 @@ async function openSitePlan(map: MapLibreMap, props: ParcelProps, geom: Polygon 
     : `Zoning unavailable · using ${site.lineFt} ft. Confirm Tables 12-411 / 12-412.`;
   syncSiteForm();
   renderDistances();
+  void refreshAttachments();
 }
 
 function clearPlaceButtons() {
@@ -290,10 +298,12 @@ function applyRemotePlan(plan: StoredPlan) {
     syncSiteForm();
     renderDistances();
   }
+  void refreshAttachments();
 }
 
 function bindClaimed(plan: StoredPlan) {
   if (site.active && site.draftPin === plan.doc.pin) setClaimed(plan);
+  void refreshAttachments();
 }
 
 function bindSyncConflict() {
@@ -350,6 +360,87 @@ async function claimCurrentParcel(map: MapLibreMap) {
   } catch (err) {
     $("status").textContent = err instanceof Error ? err.message : "Could not claim parcel";
   }
+  void refreshAttachments();
+}
+
+async function refreshAttachments() {
+  const panel = $("attachment-panel");
+  const list = $("att-list");
+  const planId = site.planId;
+  if (!currentUser || !planId) {
+    panel.hidden = true;
+    list.replaceChildren();
+    return;
+  }
+  panel.hidden = false;
+  try {
+    const rows = await listAttachments(planId);
+    list.replaceChildren();
+    if (!rows.length) {
+      const li = document.createElement("li");
+      li.textContent = "No uploads yet.";
+      list.append(li);
+      return;
+    }
+    for (const row of rows) {
+      const li = document.createElement("li");
+      li.textContent = `${row.kind} · ${row.filename}`;
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "ghost";
+      del.textContent = "Remove";
+      del.addEventListener("click", async () => {
+        try {
+          await deleteAttachment(planId, row.id);
+          await refreshAttachments();
+        } catch (err) {
+          $("status").textContent = err instanceof Error ? err.message : "Could not delete";
+        }
+      });
+      li.append(del);
+      list.append(li);
+    }
+  } catch {
+    panel.hidden = true;
+  }
+}
+
+function bindAttachments() {
+  $("att-upload").addEventListener("click", async () => {
+    const planId = site.planId;
+    if (!planId) {
+      $("status").textContent = "Claim this parcel to upload drawings.";
+      return;
+    }
+    const input = $<HTMLInputElement>("att-file");
+    const file = input.files?.[0];
+    if (!file) {
+      $("status").textContent = "Choose a PDF or image first.";
+      return;
+    }
+    const kind = $<HTMLSelectElement>("att-kind").value as AttachmentKind;
+    try {
+      $("status").textContent = "Uploading…";
+      await uploadAttachment(planId, kind, file);
+      input.value = "";
+      await refreshAttachments();
+      $("status").textContent = "Uploaded";
+    } catch (err) {
+      $("status").textContent = err instanceof Error ? err.message : "Upload failed";
+    }
+  });
+  $("att-zip").addEventListener("click", async () => {
+    const planId = site.planId;
+    if (!planId) {
+      $("status").textContent = "Claim this parcel to download attachments.";
+      return;
+    }
+    try {
+      await downloadAttachmentsZip(planId);
+    } catch (err) {
+      $("status").textContent = err instanceof Error ? err.message : "Download failed";
+    }
+  });
 }
 
 function bindSitePlan(map: MapLibreMap) {
@@ -869,6 +960,7 @@ async function boot() {
     },
   });
   bindAuthChrome();
+  bindAttachments();
   void refreshSession();
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible" && currentUser) {
