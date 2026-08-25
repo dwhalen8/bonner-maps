@@ -24,6 +24,7 @@ import {
   finishDrawing,
   handleSiteClick,
   isDrawKind,
+  shouldPreventDrawZoom,
   refreshOverlays,
   refreshSiteZoning,
   removeSelected,
@@ -529,7 +530,13 @@ async function boot() {
     map.on("click", (event) => {
       if (site.active) {
         const placing = site.placeMode;
-        if (handleSiteClick(map, [event.lngLat.lng, event.lngLat.lat])) {
+        const result = handleSiteClick(map, [event.lngLat.lng, event.lngLat.lat]);
+        if (result) {
+          if (result === "rejected") {
+            $("status").textContent =
+              placing === "leach" ? "Stay on the lot for the leach field" : "Stay on the lot";
+            return;
+          }
           if (!site.placeMode) clearPlaceButtons();
           syncDrawUi();
           syncSiteForm();
@@ -568,8 +575,9 @@ async function boot() {
     });
 
     map.on("dblclick", (event) => {
-      if (!site.active || !isDrawKind(site.placeMode)) return;
-      event.preventDefault();
+      if (!site.active) return;
+      if (shouldPreventDrawZoom()) event.preventDefault();
+      if (!isDrawKind(site.placeMode)) return;
       const feature = finishDrawing(map);
       syncDrawUi();
       syncSiteForm();

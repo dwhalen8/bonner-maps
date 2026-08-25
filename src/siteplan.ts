@@ -105,9 +105,13 @@ const SITE_SOURCES = [
 
 const DOUBLE_TAP_MS = 450;
 const DOUBLE_TAP_PX = 18;
+/** Keep map zoom off until after the finishing dblclick / tap-zoom window. */
+const DRAW_ZOOM_HOLD_MS = 450;
 
 let lastTapAt = 0;
 let lastTapPos: Position | null = null;
+let zoomHoldTimer = 0;
+let zoomHoldUntil = 0;
 
 export function isDrawKind(kind: string | null | undefined): kind is DrawKind {
   return kind === "driveway" || kind === "leach" || kind === "easement";
@@ -122,7 +126,11 @@ export function minDrawVertices(kind: DrawKind) {
 }
 
 export function canFinishDraw() {
-  return isDrawKind(site.placeMode) && site.drawVertices.length >= minDrawVertices(site.placeMode);
+  return isDrawKind(site.placeMode) && stripTailDuplicate(site.drawVertices).length >= minDrawVertices(site.placeMode);
+}
+
+export function shouldPreventDrawZoom() {
+  return isDrawKind(site.placeMode) || performance.now() < zoomHoldUntil;
 }
 
 export function drawPrompt() {
@@ -175,6 +183,28 @@ function minDistToLineFt(from: Position, coords: Position[]) {
   return snapped.properties.dist ?? Infinity;
 }
 
+function orient(a: Position, b: Position, c: Position) {
+  return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+}
+
+function segmentsCross(a: Position, b: Position, c: Position, d: Position) {
+  const o1 = orient(a, b, c);
+  const o2 = orient(a, b, d);
+  const o3 = orient(c, d, a);
+  const o4 = orient(c, d, b);
+  return o1 * o2 < 0 && o3 * o4 < 0;
+}
+
+function segmentDistFt(a: Position, b: Position, c: Position, d: Position) {
+  if (segmentsCross(a, b, c, d)) return 0;
+  return Math.min(
+    minDistToLineFt(a, [c, d]),
+    minDistToLineFt(b, [c, d]),
+    minDistToLineFt(c, [a, b]),
+    minDistToLineFt(d, [a, b]),
+  );
+}
+
 function drivewayCoords(
   driveway: Feature<LineString> | LineString | PlanFeature,
 ): Position[] | null {
@@ -194,7 +224,7 @@ function roadLineCoords(geom: Geometry | null | undefined): Position[][] {
   return [];
 }
 
-/** True when any driveway vertex (or road vertex) is ≤ 30 ft from the other line. */
+/** True when any driveway segment is ≤ 30 ft from any road segment (including crossings). */
 export function drivewayMeetsRoad(
   driveway: Feature<LineString> | LineString | PlanFeature,
   roadFeatures?: FeatureCollection | Feature[] | null,
@@ -208,11 +238,12 @@ export function drivewayMeetsRoad(
     const geom = "geometry" in road ? road.geometry : null;
     for (const line of roadLineCoords(geom)) {
       if (line.length < 2) continue;
-      for (const pt of coords) {
-        if (minDistToLineFt(pt, line) <= DRIVEWAY_MEETS_ROAD_FT) return true;
-      }
-      for (const pt of line) {
-        if (minDistToLineFt(pt, coords) <= DRIVEWAY_MEETS_ROAD_FT) return true;
+      for (let i = 0; i < coords.length - 1; i++) {
+        for (let j = 0; j < line.length - 1; j++) {
+          if (segmentDistFt(coords[i], coords[i + 1], line[j], line[j + 1]) <= DRIVEWAY_MEETS_ROAD_FT) {
+            return true;
+          }
+        }
       }
     }
   }
@@ -611,6 +642,7 @@ export function startSitePlan(
   site.drawVertices = [];
   lastTapAt = 0;
   lastTapPos = null;
+  clearZoomHold();
   setDoubleClickZoom(map, true);
   site.status = "proposed";
   site.zoning = null;
@@ -687,6 +719,7 @@ export function exitSitePlan(map: MapLibreMap) {
   site.drawVertices = [];
   lastTapAt = 0;
   lastTapPos = null;
+  clearZoomHold();
   setDoubleClickZoom(map, true);
   site.features = [];
   site.selectedId = null;
@@ -764,14 +797,31 @@ function pixelsApart(map: MapLibreMap, a: Position, b: Position) {
   return Math.hypot(pa.x - pb.x, pa.y - pb.y);
 }
 
-function isDoubleTap(map: MapLibreMap, lngLat: Position) {
-  const now = performance.now();
-  const prevAt = lastTapAt;
-  const prevPos = lastTapPos;
-  lastTapAt = now;
+function noteTap(lngLat: Position) {
+  lastTapAt = performance.now();
   lastTapPos = lngLat;
-  if (!prevPos || now - prevAt > DOUBLE_TAP_MS) return false;
-  return pixelsApart(map, prevPos, lngLat) <= DOUBLE_TAP_PX;
+}
+
+function isDoubleTap(map: MapLibreMap, lngLat: Position) {
+  if (!lastTapPos || performance.now() - lastTapAt > DOUBLE_TAP_MS) return false;
+  return pixelsApart(map, lastTapPos, lngLat) <= DOUBLE_TAP_PX;
+}
+
+function clearZoomHold() {
+  window.clearTimeout(zoomHoldTimer);
+  zoomHoldTimer = 0;
+  zoomHoldUntil = 0;
+}
+
+function holdDrawZoom(map: MapLibreMap) {
+  setDoubleClickZoom(map, false);
+  zoomHoldUntil = performance.now() + DRAW_ZOOM_HOLD_MS;
+  window.clearTimeout(zoomHoldTimer);
+  zoomHoldTimer = window.setTimeout(() => {
+    zoomHoldTimer = 0;
+    zoomHoldUntil = 0;
+    if (!isDrawKind(site.placeMode)) setDoubleClickZoom(map, true);
+  }, DRAW_ZOOM_HOLD_MS);
 }
 
 function closedRing(verts: Position[]): Position[] {
@@ -796,7 +846,8 @@ export function setPlaceMode(map: MapLibreMap, mode: PlaceMode) {
   site.drawVertices = [];
   lastTapAt = 0;
   lastTapPos = null;
-  setDoubleClickZoom(map, !isDrawKind(mode));
+  if (isDrawKind(mode)) setDoubleClickZoom(map, false);
+  else if (performance.now() >= zoomHoldUntil) setDoubleClickZoom(map, true);
   refreshDrawPreview(map);
 }
 
@@ -827,7 +878,7 @@ export function finishDrawing(map: MapLibreMap): PlanFeature | null {
   site.drawVertices = [];
   lastTapAt = 0;
   lastTapPos = null;
-  setDoubleClickZoom(map, true);
+  holdDrawZoom(map);
   schedulePersist();
   refreshOverlays(map);
   return feature;
@@ -836,16 +887,30 @@ export function finishDrawing(map: MapLibreMap): PlanFeature | null {
 export function addDrawVertex(map: MapLibreMap, lngLat: Position): "vertex" | "finished" | "rejected" {
   const kind = site.placeMode;
   if (!isDrawKind(kind)) return "rejected";
-
+  const min = minDrawVertices(kind);
   const doubled = isDoubleTap(map, lngLat);
-  const closeToLast =
-    site.drawVertices.length > 0 &&
-    pixelsApart(map, site.drawVertices[site.drawVertices.length - 1], lngLat) <= DOUBLE_TAP_PX;
-  const enough = site.drawVertices.length >= minDrawVertices(kind);
-  if (enough && (doubled || closeToLast)) {
-    return finishDrawing(map) ? "finished" : "vertex";
+  const last = site.drawVertices.at(-1);
+  const closeToLast = last != null && pixelsApart(map, last, lngLat) <= DOUBLE_TAP_PX;
+
+  if (doubled) {
+    // First click of the pair already committed a vertex; drop it if we already had enough.
+    if (last && lastTapPos && pixelsApart(map, last, lastTapPos) <= DOUBLE_TAP_PX && site.drawVertices.length - 1 >= min) {
+      site.drawVertices.pop();
+    }
+    lastTapAt = 0;
+    lastTapPos = null;
+    if (stripTailDuplicate(site.drawVertices).length >= min) {
+      return finishDrawing(map) ? "finished" : "vertex";
+    }
+    refreshDrawPreview(map);
+    return "vertex";
   }
+
   if (closeToLast) {
+    if (stripTailDuplicate(site.drawVertices).length >= min) {
+      return finishDrawing(map) ? "finished" : "vertex";
+    }
+    noteTap(lngLat);
     refreshDrawPreview(map);
     return "vertex";
   }
@@ -854,6 +919,7 @@ export function addDrawVertex(map: MapLibreMap, lngLat: Position): "vertex" | "f
   if (!allowOffParcel && site.geom && !pointInParcel(lngLat, site.geom)) return "rejected";
 
   site.drawVertices.push([lngLat[0], lngLat[1]]);
+  noteTap(lngLat);
   setDoubleClickZoom(map, false);
   refreshDrawPreview(map);
   return "vertex";
@@ -1031,24 +1097,23 @@ function pickFeatureAt(lngLat: Position): PlanFeature | null {
   return best;
 }
 
-export function handleSiteClick(map: MapLibreMap, lngLat: Position) {
+export type SiteClickResult = false | "vertex" | "finished" | "rejected" | "placed" | "selected";
+
+export function handleSiteClick(map: MapLibreMap, lngLat: Position): SiteClickResult {
   if (!site.active) return false;
-  if (isDrawKind(site.placeMode)) {
-    addDrawVertex(map, lngLat);
-    return true;
-  }
+  if (isDrawKind(site.placeMode)) return addDrawVertex(map, lngLat);
   if (isPointKind(site.placeMode)) {
     const feature = addFeature(site.placeMode, lngLat);
     site.placeMode = null;
     if (feature) refreshOverlays(map);
-    return true;
+    return "placed";
   }
   const hit = pickFeatureAt(lngLat);
   if (!hit) return false;
   site.selectedId = hit.id;
   site.status = hit.status;
   refreshOverlays(map);
-  return true;
+  return "selected";
 }
 
 export function distanceSummary() {
