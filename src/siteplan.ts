@@ -264,7 +264,7 @@ window.addEventListener("pagehide", () => {
   if (planId && doc) {
     void flushClaimedSync({
       keepalive: true,
-      snapshot: { id: planId, doc, baseServerRev: site.serverRev },
+      snapshot: { id: planId, doc },
     });
     return;
   }

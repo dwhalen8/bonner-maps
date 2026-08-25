@@ -33,7 +33,6 @@ export type ConflictChoice = "keep" | "take";
 type PushOpts = {
   keepalive?: boolean;
   doc?: PlanDoc;
-  baseServerRev?: number;
 };
 
 export type PlanStoreHooks = {
@@ -142,6 +141,57 @@ async function getStored(id: string): Promise<StoredPlan | null> {
   }
 }
 
+function txDone(tx: IDBTransaction): Promise<void> {
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onabort = () => reject(tx.error ?? new Error("idb abort"));
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+/** Read+write plans/outbox in one transaction so a concurrent PUT 200 cannot stash a stale serverRev. */
+async function writeLocalDoc(id: string, doc: PlanDoc): Promise<void> {
+  try {
+    const db = await openPlansDb();
+    const tx = db.transaction(["plans", "outbox"], "readwrite");
+    const plans = tx.objectStore("plans");
+    const outboxStore = tx.objectStore("outbox");
+    const existing = ((await idbReq(plans.get(id))) as StoredPlan | undefined) ?? null;
+    const pending = ((await idbReq(outboxStore.get(id))) as OutboxRow | undefined) ?? null;
+    const serverRev = existing?.serverRev ?? 0;
+    const baseServerRev = pending?.baseServerRev ?? serverRev;
+    plans.put({ id, pin: doc.pin, serverRev, doc });
+    outboxStore.put({ planId: id, baseServerRev });
+    await txDone(tx);
+  } catch {
+    /* private mode / quota */
+  }
+}
+
+async function ackPushSuccess(
+  id: string,
+  nextRev: number,
+  sentAt: string | undefined,
+  fallbackDoc: PlanDoc,
+): Promise<boolean> {
+  try {
+    const db = await openPlansDb();
+    const tx = db.transaction(["plans", "outbox"], "readwrite");
+    const plans = tx.objectStore("plans");
+    const outboxStore = tx.objectStore("outbox");
+    const latest = ((await idbReq(plans.get(id))) as StoredPlan | undefined) ?? null;
+    const localDoc = latest?.doc ?? fallbackDoc;
+    plans.put({ id, pin: localDoc.pin, serverRev: nextRev, doc: localDoc });
+    const stillDirty = Boolean(latest?.doc.clientEditedAt && latest.doc.clientEditedAt !== sentAt);
+    if (stillDirty) outboxStore.put({ planId: id, baseServerRev: nextRev });
+    else outboxStore.delete(id);
+    await txDone(tx);
+    return stillDirty;
+  } catch {
+    return false;
+  }
+}
+
 async function putStored(plan: StoredPlan): Promise<void> {
   try {
     await withStore("plans", "readwrite", (s) => s.put(plan));
@@ -217,12 +267,7 @@ export async function saveClaimedLocal(
   doc: PlanDoc,
   opts?: { schedule?: boolean },
 ): Promise<void> {
-  const existing = await getStored(id);
-  const pending = await getOutbox(id);
-  const serverRev = existing?.serverRev ?? 0;
-  const baseServerRev = pending?.baseServerRev ?? serverRev;
-  await putStored({ id, pin: doc.pin, serverRev, doc });
-  await putOutbox({ planId: id, baseServerRev });
+  await writeLocalDoc(id, doc);
   if (opts?.schedule === false) return;
   schedulePush(id);
 }
@@ -248,18 +293,13 @@ function enqueuePush(id: string, force = false, opts?: PushOpts): Promise<void> 
 
 export function flushClaimedSync(opts?: {
   keepalive?: boolean;
-  snapshot?: { id: string; doc: PlanDoc; baseServerRev: number };
+  snapshot?: { id: string; doc: PlanDoc };
 }): Promise<void> {
   for (const timer of pushTimers.values()) window.clearTimeout(timer);
   pushTimers.clear();
   if (opts?.snapshot) {
-    const { id, doc, baseServerRev } = opts.snapshot;
-    void saveClaimedLocal(id, doc, { schedule: false });
-    return enqueuePush(id, false, {
-      keepalive: opts.keepalive,
-      doc,
-      baseServerRev,
-    });
+    const { id, doc } = opts.snapshot;
+    return enqueuePush(id, false, { keepalive: opts.keepalive, doc });
   }
   return flushOutbox({ keepalive: opts?.keepalive });
 }
@@ -285,13 +325,14 @@ async function resolveConflict(server: RevConflict): Promise<void> {
 }
 
 async function pushPlanNow(id: string, force = false, opts?: PushOpts): Promise<void> {
+  if (opts?.doc) await writeLocalDoc(id, opts.doc);
   const stored = await getStored(id);
   const outbox = await getOutbox(id);
   const doc = opts?.doc ?? stored?.doc;
   if (!doc) return;
   if (!force && !outbox && !opts?.doc) return;
   const serverRev = stored?.serverRev ?? 0;
-  const baseServerRev = opts?.baseServerRev ?? outbox?.baseServerRev ?? serverRev;
+  const baseServerRev = outbox?.baseServerRev ?? serverRev;
   const sentAt = doc.clientEditedAt;
   if (!force && blockedTooLarge.has(id) && blockedTooLarge.get(id) === sentAt) {
     return;
@@ -316,22 +357,9 @@ async function pushPlanNow(id: string, force = false, opts?: PushOpts): Promise<
     );
     if (status === 200 && body && body.doc) {
       blockedTooLarge.delete(id);
-      const latest = await getStored(id);
       const nextRev = body.serverRev;
-      const localDoc = latest?.doc ?? doc;
-      await putStored({
-        id: body.id,
-        pin: localDoc.pin,
-        serverRev: nextRev,
-        doc: localDoc,
-      });
-      const stillDirty = latest && latest.doc.clientEditedAt && latest.doc.clientEditedAt !== sentAt;
-      if (stillDirty) {
-        await putOutbox({ planId: id, baseServerRev: nextRev });
-        schedulePush(id);
-      } else {
-        await deleteOutbox(id);
-      }
+      const stillDirty = await ackPushSuccess(id, nextRev, sentAt, doc);
+      if (stillDirty) schedulePush(id);
       hooks.onAck?.(body.id, nextRev);
       hooks.onStatus?.("Saved just now");
       return;
