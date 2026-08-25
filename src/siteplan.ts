@@ -150,19 +150,41 @@ function snapshotDoc(): PlanDoc | null {
   };
 }
 
-export function persistDraft() {
+export async function persistDraft(): Promise<void> {
   window.clearTimeout(persistTimer);
   persistTimer = 0;
+  const planId = site.planId;
   const doc = snapshotDoc();
   if (!doc) return;
-  if (site.planId) {
-    void saveClaimedLocal(site.planId, doc);
+  if (planId) {
+    await saveClaimedLocal(planId, doc);
     return;
   }
   try {
     localStorage.setItem(draftKey(doc.pin), JSON.stringify(doc));
   } catch {
     // private mode / quota — keep working in memory
+  }
+}
+
+export async function flushPersist(): Promise<void> {
+  window.clearTimeout(persistTimer);
+  persistTimer = 0;
+  await persistDraft();
+}
+
+export function peekAnonDraft(pin: string): PlanDoc | null {
+  if (site.draftPin === pin) {
+    const live = snapshotDoc();
+    if (live) return live;
+  }
+  return loadDraft(pin);
+}
+
+export function dropClaimed(id: string) {
+  if (site.planId === id) {
+    site.planId = null;
+    site.serverRev = 0;
   }
 }
 
@@ -235,8 +257,24 @@ export function schedulePersist() {
 }
 
 window.addEventListener("pagehide", () => {
-  persistDraft();
-  flushClaimedSync();
+  window.clearTimeout(persistTimer);
+  persistTimer = 0;
+  const planId = site.planId;
+  const doc = snapshotDoc();
+  if (planId && doc) {
+    void flushClaimedSync({
+      keepalive: true,
+      snapshot: { id: planId, doc, baseServerRev: site.serverRev },
+    });
+    return;
+  }
+  if (doc) {
+    try {
+      localStorage.setItem(draftKey(doc.pin), JSON.stringify(doc));
+    } catch {
+      /* private mode / quota */
+    }
+  }
 });
 
 function setSrc(map: MapLibreMap, id: string, data: FeatureCollection) {

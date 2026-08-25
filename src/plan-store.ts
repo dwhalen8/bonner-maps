@@ -3,6 +3,7 @@ import type { PlanDoc } from "@shared/plan";
 const DB_NAME = "bonner-plans";
 const DB_VERSION = 1;
 const PUT_DEBOUNCE_MS = 1500;
+const KEEP_ALIVE_MAX = 64 * 1024;
 
 export type StoredPlan = {
   id: string;
@@ -29,12 +30,21 @@ type OutboxRow = { planId: string; baseServerRev: number };
 
 export type ConflictChoice = "keep" | "take";
 
+type PushOpts = {
+  keepalive?: boolean;
+  doc?: PlanDoc;
+  baseServerRev?: number;
+};
+
 export type PlanStoreHooks = {
   onStatus?: (msg: string) => void;
   onConflict?: (conflict: RevConflict) => Promise<ConflictChoice>;
   onReplace?: (plan: StoredPlan) => void;
   onAck?: (id: string, serverRev: number) => void;
+  onBound?: (plan: StoredPlan) => void;
+  onDropped?: (id: string) => void;
   onUnauthorized?: () => void;
+  peekAnonDraft?: (pin: string) => PlanDoc | null;
 };
 
 let hooks: PlanStoreHooks = {};
@@ -49,11 +59,26 @@ function errorMessage(body: ApiErrorBody | undefined, fallback: string) {
   return body && typeof body.error === "string" ? body.error : fallback;
 }
 
-async function apiJson<T>(path: string, init?: RequestInit): Promise<{ status: number; body: T }> {
+export function draftHasWork(doc: PlanDoc | null | undefined): boolean {
+  if (!doc) return false;
+  if (doc.features.length > 0) return true;
+  if (typeof doc.notes === "string" && doc.notes.trim()) return true;
+  if (doc.accessory) return true;
+  if (doc.use && doc.use !== "Single-family dwelling") return true;
+  return false;
+}
+
+async function apiJson<T>(
+  path: string,
+  init?: RequestInit,
+  extra?: { keepalive?: boolean },
+): Promise<{ status: number; body: T }> {
+  const headers = { ...(init?.headers as Record<string, string> | undefined) };
   const res = await fetch(path, {
     credentials: "include",
-    keepalive: init?.method === "PUT" || init?.method === "POST",
     ...init,
+    headers,
+    keepalive: extra?.keepalive === true,
   });
   let body = null as T;
   if (res.status !== 204) {
@@ -125,6 +150,14 @@ async function putStored(plan: StoredPlan): Promise<void> {
   }
 }
 
+async function deleteStored(id: string): Promise<void> {
+  try {
+    await withStore("plans", "readwrite", (s) => s.delete(id));
+  } catch {
+    /* ignore */
+  }
+}
+
 async function getOutbox(id: string): Promise<OutboxRow | null> {
   try {
     return (await withStore("outbox", "readonly", (s) => s.get(id))) ?? null;
@@ -175,14 +208,22 @@ export async function rememberPlan(plan: StoredPlan): Promise<void> {
 }
 
 const pushTimers = new Map<string, number>();
+const pushChain = new Map<string, Promise<void>>();
+/** clientEditedAt of a 413 payload; skip retry until the doc changes. */
+const blockedTooLarge = new Map<string, string | undefined>();
 
-export async function saveClaimedLocal(id: string, doc: PlanDoc): Promise<void> {
+export async function saveClaimedLocal(
+  id: string,
+  doc: PlanDoc,
+  opts?: { schedule?: boolean },
+): Promise<void> {
   const existing = await getStored(id);
   const pending = await getOutbox(id);
   const serverRev = existing?.serverRev ?? 0;
   const baseServerRev = pending?.baseServerRev ?? serverRev;
   await putStored({ id, pin: doc.pin, serverRev, doc });
   await putOutbox({ planId: id, baseServerRev });
+  if (opts?.schedule === false) return;
   schedulePush(id);
 }
 
@@ -190,18 +231,37 @@ function schedulePush(id: string) {
   window.clearTimeout(pushTimers.get(id) ?? 0);
   const t = window.setTimeout(() => {
     pushTimers.delete(id);
-    void pushPlan(id);
+    void enqueuePush(id);
   }, PUT_DEBOUNCE_MS);
   pushTimers.set(id, t);
 }
 
-export function flushClaimedSync() {
-  for (const [id, timer] of pushTimers) {
-    window.clearTimeout(timer);
-    pushTimers.delete(id);
-    void pushPlan(id);
+function enqueuePush(id: string, force = false, opts?: PushOpts): Promise<void> {
+  const prev = pushChain.get(id) ?? Promise.resolve();
+  const next = prev.then(
+    () => pushPlanNow(id, force, opts),
+    () => pushPlanNow(id, force, opts),
+  );
+  pushChain.set(id, next);
+  return next;
+}
+
+export function flushClaimedSync(opts?: {
+  keepalive?: boolean;
+  snapshot?: { id: string; doc: PlanDoc; baseServerRev: number };
+}): Promise<void> {
+  for (const timer of pushTimers.values()) window.clearTimeout(timer);
+  pushTimers.clear();
+  if (opts?.snapshot) {
+    const { id, doc, baseServerRev } = opts.snapshot;
+    void saveClaimedLocal(id, doc, { schedule: false });
+    return enqueuePush(id, false, {
+      keepalive: opts.keepalive,
+      doc,
+      baseServerRev,
+    });
   }
-  void flushOutbox();
+  return flushOutbox({ keepalive: opts?.keepalive });
 }
 
 async function resolveConflict(server: RevConflict): Promise<void> {
@@ -216,34 +276,49 @@ async function resolveConflict(server: RevConflict): Promise<void> {
     };
     await putStored(plan);
     await deleteOutbox(server.id);
+    blockedTooLarge.delete(server.id);
     hooks.onReplace?.(plan);
     hooks.onStatus?.("Loaded server copy");
     return;
   }
-  await pushPlan(server.id, true);
+  await pushPlanNow(server.id, true);
 }
 
-async function pushPlan(id: string, force = false): Promise<void> {
+async function pushPlanNow(id: string, force = false, opts?: PushOpts): Promise<void> {
   const stored = await getStored(id);
   const outbox = await getOutbox(id);
-  if (!stored) return;
-  if (!force && !outbox) return;
-  const baseServerRev = outbox?.baseServerRev ?? stored.serverRev;
-  const sentAt = stored.doc.clientEditedAt;
+  const doc = opts?.doc ?? stored?.doc;
+  if (!doc) return;
+  if (!force && !outbox && !opts?.doc) return;
+  const serverRev = stored?.serverRev ?? 0;
+  const baseServerRev = opts?.baseServerRev ?? outbox?.baseServerRev ?? serverRev;
+  const sentAt = doc.clientEditedAt;
+  if (!force && blockedTooLarge.has(id) && blockedTooLarge.get(id) === sentAt) {
+    return;
+  }
+
+  const payload = JSON.stringify({
+    doc,
+    baseServerRev,
+    ...(force ? { force: true } : {}),
+  });
+  const keepalive = opts?.keepalive === true && payload.length < KEEP_ALIVE_MAX;
+
   try {
-    const { status, body } = await apiJson<RevConflict & ApiErrorBody>(`/api/plans/${id}`, {
-      method: "PUT",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        doc: stored.doc,
-        baseServerRev,
-        ...(force ? { force: true } : {}),
-      }),
-    });
+    const { status, body } = await apiJson<RevConflict & ApiErrorBody>(
+      `/api/plans/${id}`,
+      {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: payload,
+      },
+      { keepalive },
+    );
     if (status === 200 && body && body.doc) {
+      blockedTooLarge.delete(id);
       const latest = await getStored(id);
       const nextRev = body.serverRev;
-      const localDoc = latest?.doc ?? stored.doc;
+      const localDoc = latest?.doc ?? doc;
       await putStored({
         id: body.id,
         pin: localDoc.pin,
@@ -269,6 +344,19 @@ async function pushPlan(id: string, force = false): Promise<void> {
       hooks.onStatus?.("Sign in again to sync");
       return;
     }
+    if (status === 404) {
+      await deleteOutbox(id);
+      await deleteStored(id);
+      blockedTooLarge.delete(id);
+      hooks.onDropped?.(id);
+      hooks.onStatus?.("Plan was deleted on the server");
+      return;
+    }
+    if (status === 413) {
+      blockedTooLarge.set(id, sentAt);
+      hooks.onStatus?.("Plan too large to sync");
+      return;
+    }
     hooks.onStatus?.("Offline — will sync");
   } catch {
     hooks.onStatus?.("Offline — will sync");
@@ -285,11 +373,29 @@ async function fetchPlan(id: string): Promise<StoredPlan | null> {
   }
 }
 
-async function flushOutbox(): Promise<void> {
+async function flushOutbox(opts?: { keepalive?: boolean }): Promise<void> {
   const rows = await allOutbox();
   for (const row of rows) {
-    await pushPlan(row.planId);
+    await enqueuePush(row.planId, false, { keepalive: opts?.keepalive });
   }
+}
+
+async function attachLocalDraft(full: StoredPlan, localDoc: PlanDoc): Promise<StoredPlan> {
+  const attached: StoredPlan = {
+    id: full.id,
+    pin: full.pin,
+    serverRev: full.serverRev,
+    doc: localDoc,
+  };
+  await putStored({
+    id: full.id,
+    pin: full.pin,
+    serverRev: full.serverRev,
+    doc: full.doc,
+  });
+  await saveClaimedLocal(full.id, localDoc);
+  hooks.onBound?.(attached);
+  return attached;
 }
 
 export async function claimPlan(input: {
@@ -318,6 +424,9 @@ export async function claimPlan(input: {
     if (hit) {
       const full = await fetchPlan(hit.id);
       if (full) {
+        if (input.doc && draftHasWork(input.doc)) {
+          return attachLocalDraft(full, input.doc);
+        }
         await rememberPlan(full);
         return full;
       }
@@ -350,15 +459,25 @@ export async function pullPlans(): Promise<void> {
     return;
   }
   for (const item of list) {
-    const local = await getStored(item.id);
-    const dirty = await getOutbox(item.id);
+    let local = await getStored(item.id);
+    let dirty = await getOutbox(item.id);
+    const anon = hooks.peekAnonDraft?.(item.pin);
     if (!local) {
       const full = await fetchPlan(item.id);
-      if (full) {
-        await putStored(full);
-        hooks.onReplace?.(full);
+      if (!full) continue;
+      if (anon && draftHasWork(anon)) {
+        await attachLocalDraft(full, anon);
+        continue;
       }
+      await putStored(full);
+      hooks.onReplace?.(full);
       continue;
+    }
+    if (anon && draftHasWork(anon) && !dirty) {
+      await saveClaimedLocal(local.id, anon);
+      hooks.onBound?.({ id: local.id, pin: local.pin, serverRev: local.serverRev, doc: anon });
+      dirty = await getOutbox(local.id);
+      local = (await getStored(local.id)) ?? { ...local, doc: anon };
     }
     if (local.serverRev < item.serverRev) {
       const full = await fetchPlan(item.id);

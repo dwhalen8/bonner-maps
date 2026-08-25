@@ -7,6 +7,7 @@ import { logout, me, requestOtp, verifyOtp, type Me } from "./auth";
 import { toParcelSnapshot } from "@shared/plan";
 import {
   claimPlan,
+  draftHasWork,
   planByPin,
   pullPlans,
   setPlanStoreHooks,
@@ -34,8 +35,11 @@ import {
   clearAnonDraft,
   distanceSummary,
   docForClaim,
+  dropClaimed,
   exitSitePlan,
+  flushPersist,
   handleSiteClick,
+  peekAnonDraft,
   refreshOverlays,
   refreshSiteZoning,
   removeSelected,
@@ -194,7 +198,10 @@ function promptSignIn(message: string) {
 }
 
 function applyRemotePlan(plan: StoredPlan) {
-  if (site.planId !== plan.id && !(site.active && site.draftPin === plan.doc.pin)) return;
+  const sameOpenPin = site.active && site.draftPin === plan.doc.pin;
+  const claimed = site.planId === plan.id;
+  const emptyAnon = sameOpenPin && !site.planId && !draftHasWork(peekAnonDraft(plan.doc.pin));
+  if (!claimed && !emptyAnon) return;
   applyClaimedPlan(plan);
   const map = siteMap;
   if (site.active && map) {
@@ -202,6 +209,10 @@ function applyRemotePlan(plan: StoredPlan) {
     syncSiteForm();
     renderDistances();
   }
+}
+
+function bindClaimed(plan: StoredPlan) {
+  if (site.active && site.draftPin === plan.doc.pin) setClaimed(plan);
 }
 
 function bindSyncConflict() {
@@ -582,7 +593,11 @@ async function refreshSession() {
       $("auth-status").textContent = "That sign-in link is invalid or already used.";
     }
   }
-  if (user) void pullPlans().catch(() => undefined);
+  if (user) {
+    void flushPersist()
+      .then(() => pullPlans())
+      .catch(() => undefined);
+  }
 }
 
 function bindAuthChrome() {
@@ -671,6 +686,9 @@ async function boot() {
     onConflict: bindSyncConflict(),
     onReplace: applyRemotePlan,
     onAck: ackServerRev,
+    onBound: bindClaimed,
+    onDropped: dropClaimed,
+    peekAnonDraft,
     onUnauthorized() {
       currentUser = null;
       renderAuth(null);
@@ -681,7 +699,9 @@ async function boot() {
   void refreshSession();
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible" && currentUser) {
-      void pullPlans().catch(() => undefined);
+      void flushPersist()
+        .then(() => pullPlans())
+        .catch(() => undefined);
     }
   });
   bindInstall();
