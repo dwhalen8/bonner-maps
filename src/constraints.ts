@@ -255,6 +255,8 @@ interface LayerSpec {
   outFields: string;
   federal?: boolean;
   tag?: Record<string, unknown>;
+  src: string;
+  layer: number;
 }
 
 async function queryPage(
@@ -306,18 +308,79 @@ async function queryPage(
   return { text, data };
 }
 
-async function clipLayer(spec: LayerSpec, envelope: QueryEnvelope, signal: AbortSignal): Promise<LayerClip> {
+function taggedClip(clip: LayerClip, tag?: Record<string, unknown>): LayerClip {
+  if (!tag) return clip;
+  return {
+    ...clip,
+    features: clip.features.map((f) => ({
+      ...f,
+      properties: { ...(f.properties ?? {}), ...tag },
+    })),
+  };
+}
+
+/** Auth-gated fallback only after a CORS failure. Not an accelerator for layers that work direct. */
+async function clipViaProxy(
+  spec: LayerSpec,
+  geom: Polygon | MultiPolygon,
+  signal: AbortSignal,
+): Promise<LayerClip | null> {
+  try {
+    const res = await fetch("/api/gis/clip", {
+      method: "POST",
+      credentials: "include",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ src: spec.src, layer: spec.layer, geom }),
+      signal,
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as LayerClip;
+    if (!data || data.type !== "FeatureCollection" || !Array.isArray(data.features)) return null;
+    return {
+      type: "FeatureCollection",
+      features: data.features.flatMap((raw) => {
+        const feat = asFeature(raw);
+        return feat ? [feat] : [];
+      }),
+      incomplete: Boolean(data.incomplete),
+      fetchedAt: typeof data.fetchedAt === "string" ? data.fetchedAt : nowIso(),
+      truncatedReason: data.truncatedReason,
+    };
+  } catch (err) {
+    if (isAbort(err)) throw err;
+    return null;
+  }
+}
+
+async function clipLayer(
+  spec: LayerSpec,
+  envelope: QueryEnvelope,
+  geom: Polygon | MultiPolygon,
+  signal: AbortSignal,
+): Promise<LayerClip> {
   const fetchedAt = nowIso();
   // Clock starts at first network attempt (when the worker picks this layer up).
   const deadline = Date.now() + WALL_MS;
-  if (spec.federal) {
+
+  const proxyAfterCors = async (): Promise<LayerClip> => {
     try {
-      const probe = await withTimeout(deadline, signal, (s) => probeDirect(spec.url, s));
-      if (probe === "cors") return emptyClip("cors", { fetchedAt });
+      const proxied = await withTimeout(deadline, signal, (s) => clipViaProxy(spec, geom, s));
+      if (proxied) return taggedClip(proxied, spec.tag);
     } catch (err) {
       if (signal.aborted) throw err;
       if (isAbort(err)) return emptyClip("timeout", { fetchedAt });
-      if (isTypeError(err)) return emptyClip("cors", { fetchedAt });
+    }
+    return emptyClip("cors", { fetchedAt });
+  };
+
+  if (spec.federal) {
+    try {
+      const probe = await withTimeout(deadline, signal, (s) => probeDirect(spec.url, s));
+      if (probe === "cors") return proxyAfterCors();
+    } catch (err) {
+      if (signal.aborted) throw err;
+      if (isAbort(err)) return emptyClip("timeout", { fetchedAt });
+      if (isTypeError(err)) return proxyAfterCors();
       throw err;
     }
   }
@@ -384,6 +447,13 @@ async function clipLayer(spec: LayerSpec, envelope: QueryEnvelope, signal: Abort
         truncatedReason = worseReason(truncatedReason, "timeout");
       } else throw err;
     } else if (isTypeError(err)) {
+      try {
+        const proxied = await withTimeout(deadline, signal, (s) => clipViaProxy(spec, geom, s));
+        if (proxied) return taggedClip(proxied, spec.tag);
+      } catch (proxyErr) {
+        if (signal.aborted) throw proxyErr;
+        if (isAbort(proxyErr)) return emptyClip("timeout", { fetchedAt, features: kept, incomplete: true });
+      }
       return emptyClip("cors", { fetchedAt, features: kept, incomplete: true });
     } else {
       incomplete = true;
@@ -484,6 +554,7 @@ async function runJobs(
   jobs: ClipJob[],
   limit: number,
   envelope: QueryEnvelope,
+  geom: Polygon | MultiPolygon,
   signal: AbortSignal,
   gen: number,
 ) {
@@ -495,7 +566,7 @@ async function runJobs(
       if (gen !== generation || signal.aborted) return;
       const job = jobs[idx];
       try {
-        const layer = await clipLayer(job.spec, envelope, signal);
+        const layer = await clipLayer(job.spec, envelope, geom, signal);
         if (gen !== generation) return;
         job.apply(layer);
       } catch {
@@ -571,43 +642,43 @@ export async function fetchConstraintOverlays(
   };
 
   const county: ClipJob[] = [
-    { spec: { url: GIS_LAYERS.row, outFields: "objectid" }, apply: (layer) => { clip.row = layer; } },
-    { spec: { url: GIS_LAYERS.driveway, outFields: "Permissions" }, apply: (layer) => { clip.drivewaysCounty = layer; } },
+    { spec: { url: GIS_LAYERS.row, outFields: "objectid", src: "county-cadastral", layer: 5 }, apply: (layer) => { clip.row = layer; } },
+    { spec: { url: GIS_LAYERS.driveway, outFields: "Permissions", src: "county-address", layer: 1 }, apply: (layer) => { clip.drivewaysCounty = layer; } },
     {
-      spec: { url: GIS_LAYERS.roads, outFields: "fullname,fullname_abbr,roadclass", tag: { transLayer: 3 } },
+      spec: { url: GIS_LAYERS.roads, outFields: "fullname,fullname_abbr,roadclass", tag: { transLayer: 3 }, src: "county-trans", layer: 3 },
       apply: (layer) => addRoad(3, layer),
     },
     {
-      spec: { url: GIS_LAYERS.roadsCounty, outFields: "st_name_full,maint_by", tag: { transLayer: 4 } },
+      spec: { url: GIS_LAYERS.roadsCounty, outFields: "st_name_full,maint_by", tag: { transLayer: 4 }, src: "county-trans", layer: 4 },
       apply: (layer) => addRoad(4, layer),
     },
     {
-      spec: { url: GIS_LAYERS.roadsUsfs, outFields: "name,oper_maint_level", tag: { transLayer: 5 } },
+      spec: { url: GIS_LAYERS.roadsUsfs, outFields: "name,oper_maint_level", tag: { transLayer: 5 }, src: "county-trans", layer: 5 },
       apply: (layer) => addRoad(5, layer),
     },
     {
-      spec: { url: GIS_LAYERS.roadsOwner, outFields: "st_name_full,owned_by", tag: { transLayer: 7 } },
+      spec: { url: GIS_LAYERS.roadsOwner, outFields: "st_name_full,owned_by", tag: { transLayer: 7 }, src: "county-trans", layer: 7 },
       apply: (layer) => addRoad(7, layer),
     },
-    { spec: { url: GIS_LAYERS.zoning, outFields: "zonedesc" }, apply: (layer) => { clip.zoningFill = layer; } },
-    { spec: { url: GIS_LAYERS.cityImpact, outFields: "city" }, apply: (layer) => { clip.cityImpact = layer; } },
+    { spec: { url: GIS_LAYERS.zoning, outFields: "zonedesc", src: "county-zoning", layer: 2 }, apply: (layer) => { clip.zoningFill = layer; } },
+    { spec: { url: GIS_LAYERS.cityImpact, outFields: "city", src: "county-zoning", layer: 0 }, apply: (layer) => { clip.cityImpact = layer; } },
   ];
 
   const federal: ClipJob[] = [
     {
-      spec: { url: GIS_LAYERS.nfhl, outFields: "FLD_ZONE,ZONE_SUBTY", federal: true },
+      spec: { url: GIS_LAYERS.nfhl, outFields: "FLD_ZONE,ZONE_SUBTY", federal: true, src: "nfhl", layer: 28 },
       apply: (layer) => { clip.flood = layer; },
     },
     {
-      spec: { url: GIS_LAYERS.nwi, outFields: "Wetlands.WETLAND_TYPE,Wetlands.ATTRIBUTE", federal: true },
+      spec: { url: GIS_LAYERS.nwi, outFields: "Wetlands.WETLAND_TYPE,Wetlands.ATTRIBUTE", federal: true, src: "nwi", layer: 0 },
       apply: (layer) => { clip.wetlands = { ...layer, features: layer.features.map(normalizeNwi) }; },
     },
     {
-      spec: { url: GIS_LAYERS.nhdWaterbody, outFields: "gnis_name,FCODE,FTYPE", federal: true, tag: { nhdLayer: 12 } },
+      spec: { url: GIS_LAYERS.nhdWaterbody, outFields: "gnis_name,FCODE,FTYPE", federal: true, tag: { nhdLayer: 12 }, src: "nhd", layer: 12 },
       apply: (layer) => addWater(12, layer),
     },
     {
-      spec: { url: GIS_LAYERS.nhdFlowline, outFields: "gnis_name,FCODE,FTYPE", federal: true, tag: { nhdLayer: 6 } },
+      spec: { url: GIS_LAYERS.nhdFlowline, outFields: "gnis_name,FCODE,FTYPE", federal: true, tag: { nhdLayer: 6 }, src: "nhd", layer: 6 },
       apply: (layer) => addWater(6, layer),
     },
   ];
@@ -622,7 +693,7 @@ export async function fetchConstraintOverlays(
 
   try {
     // County shares one host (~6 connections). Cap concurrency; 8 s clock starts per job.
-    await Promise.all([runJobs(county, 3, envelope, signal, gen), runJobs(federal, 4, envelope, signal, gen)]);
+    await Promise.all([runJobs(county, 3, envelope, geom, signal, gen), runJobs(federal, 4, envelope, geom, signal, gen)]);
     if (gen !== generation) return null;
     return clip;
   } catch (err) {

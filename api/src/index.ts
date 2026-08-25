@@ -4,6 +4,7 @@ import { mkdirSync } from "node:fs";
 import { mountAttachments } from "./attachments";
 import { assertMailerForProduction, mountAuth } from "./auth";
 import { migrate, metrics, openDatabase } from "./db";
+import { mountGis } from "./gis";
 import { mountPlans } from "./plans";
 
 const DATABASE_PATH = process.env.DATABASE_PATH ?? "./data/bonner.sqlite";
@@ -57,6 +58,7 @@ api.get("/healthz", (c) => {
 mountAuth(api, db);
 mountPlans(api, db);
 mountAttachments(api, db, UPLOAD_DIR);
+mountGis(api, db);
 
 const app = new Hono();
 app.route("/api", api);
