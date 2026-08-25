@@ -243,6 +243,10 @@ dd { margin: 2px 0 0; }
   outline: none;
   color: #d8f3dc;
 }
+.view-toggle .ghost:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
 .sheet .check { display: flex; align-items: center; gap: 8px; margin-top: 22px; }
 .sheet .row .check { white-space: nowrap; }
 .btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }

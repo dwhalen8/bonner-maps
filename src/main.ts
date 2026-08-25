@@ -148,13 +148,17 @@ function fillPrintBlock() {
 
 function syncViewToggle() {
   const isPlan = site.view === "plan";
+  const drawingUse = site.placeMode === "use_area";
   $("view-plan").classList.toggle("active", isPlan);
   $("view-packet").classList.toggle("active", !isPlan);
   $("view-plan").setAttribute("aria-pressed", String(isPlan));
   $("view-packet").setAttribute("aria-pressed", String(!isPlan));
-  $("view-hint").textContent = isPlan
-    ? "Plan is the working map. Packet hides use areas unless Show on packet is checked."
-    : "Packet preview — use areas hidden unless Show on packet is checked.";
+  $<HTMLButtonElement>("view-packet").disabled = drawingUse;
+  $("view-hint").textContent = drawingUse
+    ? "Finish the use area before switching to Packet — new polygons stay off the packet unless Show on packet is checked."
+    : isPlan
+      ? "Plan is the working map. Packet hides use areas unless Show on packet is checked."
+      : "Packet preview — use areas hidden unless Show on packet is checked.";
 }
 
 function syncUseAreaFields() {
@@ -243,6 +247,7 @@ function bindSitePlan(map: MapLibreMap) {
   });
 
   const applyView = (view: PlanView) => {
+    if (site.placeMode === "use_area" && view === "packet") return;
     setView(map, view);
     syncViewToggle();
   };
@@ -305,14 +310,13 @@ function bindSitePlan(map: MapLibreMap) {
 
   $("site-use-class").addEventListener("change", (event) => {
     site.useClass = parseUseClass((event.target as HTMLSelectElement).value);
-    if (selectedFeature()?.kind === "use_area") {
+    if (!site.placeMode && selectedFeature()?.kind === "use_area") {
       updateSelected({ useClass: site.useClass });
       refreshOverlays(map);
-      syncUseAreaFields();
     }
   });
   $("site-on-packet").addEventListener("change", (event) => {
-    if (selectedFeature()?.kind !== "use_area") return;
+    if (site.placeMode || selectedFeature()?.kind !== "use_area") return;
     updateSelected({ onPacket: (event.target as HTMLInputElement).checked });
     refreshOverlays(map);
   });
@@ -326,6 +330,7 @@ function bindSitePlan(map: MapLibreMap) {
       }
       $("status").textContent = prompt;
       syncDrawUi();
+      syncViewToggle();
       syncUseAreaFields();
     });
   };

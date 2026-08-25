@@ -930,6 +930,7 @@ export function updateSelected(
 }
 
 export function setView(map: MapLibreMap, view: PlanView) {
+  if (site.placeMode === "use_area" && view === "packet") return;
   site.view = view;
   refreshOverlays(map);
 }
@@ -1225,6 +1226,9 @@ export function refreshOverlays(map: MapLibreMap) {
 }
 
 function pickFeatureAt(lngLat: Position): PlanFeature | null {
+  // Visual order: structures / leach / easement (paint above use-area), then
+  // points and driveway lines, then use-area last so a garden ring cannot steal
+  // taps from the house, well, septic, or driveway it covers.
   for (let i = site.features.length - 1; i >= 0; i--) {
     const feature = site.features[i];
     if (feature.kind === "structure") {
@@ -1232,11 +1236,11 @@ function pickFeatureAt(lngLat: Position): PlanFeature | null {
       if (poly && pointInParcel(lngLat, poly.geometry)) return feature;
     }
     if (
-      (feature.kind === "leach" || feature.kind === "easement" || feature.kind === "use_area") &&
+      (feature.kind === "leach" || feature.kind === "easement") &&
       feature.geom.type === "Polygon" &&
       pointInParcel(lngLat, feature.geom)
     ) {
-      if (featureVisible(feature)) return feature;
+      return feature;
     }
   }
   let best: PlanFeature | null = null;
@@ -1258,7 +1262,14 @@ function pickFeatureAt(lngLat: Position): PlanFeature | null {
       }
     }
   }
-  return best;
+  if (best) return best;
+  for (let i = site.features.length - 1; i >= 0; i--) {
+    const feature = site.features[i];
+    if (feature.kind !== "use_area" || feature.geom.type !== "Polygon") continue;
+    if (!featureVisible(feature)) continue;
+    if (pointInParcel(lngLat, feature.geom)) return feature;
+  }
+  return null;
 }
 
 export type SiteClickResult = false | "vertex" | "finished" | "rejected" | "placed" | "selected";
