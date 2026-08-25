@@ -412,8 +412,8 @@ dd { margin: 2px 0 0; }
   html.print-letter .print-title-block {
     display: flex;
     height: auto;
-    max-height: 4.2in;
-    overflow: hidden;
+    max-height: none;
+    overflow: visible;
     margin-top: 8px;
   }
   html.print-letter .north { top: 4.95in; }

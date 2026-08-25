@@ -548,10 +548,12 @@ export async function fetchConstraintOverlays(
     });
     // Prefer Transportation/3 centerlines so the merged 200 / 500 KB cap does not drop them.
     roadParts.sort((a, b) => a.layer - b.layer);
-    clip.roads = mergeClips(
+    const merged = mergeClips(
       roadParts.map((p) => p.clip),
       fetchedAt,
     );
+    // Four trans layers; a single early arrival must not look complete.
+    clip.roads = roadParts.length < 4 ? { ...merged, incomplete: true } : merged;
   };
 
   const addWater = (nhdLayer: 6 | 12, part: LayerClip) => {
@@ -561,10 +563,11 @@ export async function fetchConstraintOverlays(
     });
     // Prefer waterbodies (12) so shoreline 40 ft lakes survive the merged cap.
     waterParts.sort((a, b) => b.layer - a.layer);
-    clip.water = mergeClips(
+    const merged = mergeClips(
       waterParts.map((p) => p.clip),
       fetchedAt,
     );
+    clip.water = waterParts.length < 2 ? { ...merged, incomplete: true } : merged;
   };
 
   const county: ClipJob[] = [
