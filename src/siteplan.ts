@@ -5,10 +5,12 @@ import { PLAN_DOC_VERSION, toParcelSnapshot } from "@shared/plan";
 import type { ParcelProps } from "./types";
 import {
   compass,
+  eaveEnvelope,
   feetBetween,
   formatFeet,
   inwardSetback,
   minDistToEdgeFt,
+  nearestOnPolygonFt,
   parcelBbox,
   parcelCentroid,
   parcelEdges,
@@ -17,8 +19,12 @@ import {
 } from "./geo";
 import { fetchZoningAt, ruleForZone, type SetbackRule } from "./setbacks";
 
-export type SiteKind = "structure" | "well" | "septic";
+export type SiteKind = "structure" | "well" | "septic" | "front_door";
 export type PlaceMode = null | SiteKind;
+
+export const DEFAULT_EAVE_FT = 2;
+export const DOOR_SNAP_FT = 12;
+export const DOOR_REJECT_MSG = "Tap on the building edge (door must sit on the wall/eave).";
 
 export interface SiteState {
   active: boolean;
@@ -35,6 +41,7 @@ export interface SiteState {
   widthFt: number;
   lengthFt: number;
   rotationDeg: number;
+  eaveFt: number;
   use: string;
   notes: string;
   /** Frozen at startSitePlan; persist key. Not the inspector parcel. */
@@ -62,6 +69,7 @@ export const site: SiteState = {
   widthFt: 40,
   lengthFt: 60,
   rotationDeg: 0,
+  eaveFt: DEFAULT_EAVE_FT,
   use: "Single-family dwelling",
   notes: "",
   draftPin: null,
@@ -80,6 +88,7 @@ function featureCenter(feature: PlanFeature): Position | null {
 function defaultLabel(kind: SiteKind, status: FeatureStatus) {
   if (kind === "structure") return status === "existing" ? "Existing structure" : "Proposed structure";
   if (kind === "well") return status === "existing" ? "Existing well" : "Well";
+  if (kind === "front_door") return "Front door";
   return status === "existing" ? "Existing septic" : "Septic";
 }
 
@@ -89,6 +98,17 @@ function structurePoly(feature: PlanFeature) {
   const length = feature.props.lengthFt;
   if (!center || !width || !length) return null;
   return rectanglePolygon(center, width, length, feature.props.rotationDeg ?? 0);
+}
+
+function structureEaveFt(feature: PlanFeature) {
+  const n = feature.props.eaveFt;
+  return n != null && Number.isFinite(n) && n >= 0 ? n : DEFAULT_EAVE_FT;
+}
+
+function structureEnvelope(feature: PlanFeature) {
+  const poly = structurePoly(feature);
+  if (!poly) return null;
+  return eaveEnvelope(poly, structureEaveFt(feature));
 }
 
 function isDraftFeature(value: unknown): value is PlanFeature {
@@ -108,9 +128,12 @@ function loadDraft(pin: string): PlanDoc | null {
     parsed.features = parsed.features.filter(isDraftFeature).map((f) => ({
       ...f,
       status: f.status === "existing" ? "existing" : "proposed",
-      label: f.label || f.kind,
+      label: f.kind === "front_door" ? "Front door" : f.label || f.kind,
       onPacket: f.onPacket !== false,
-      props: f.props ?? {},
+      props: {
+        ...(f.props ?? {}),
+        ...(f.kind === "structure" ? { eaveFt: f.props?.eaveFt ?? DEFAULT_EAVE_FT } : {}),
+      },
     }));
     return parsed;
   } catch {
@@ -169,6 +192,7 @@ export function addSiteLayers(map: MapLibreMap) {
     ["site-parcel", "geojson"],
     ["site-setback", "geojson"],
     ["site-edges", "geojson"],
+    ["site-envelope", "geojson"],
     ["site-structure", "geojson"],
     ["site-points", "geojson"],
   ];
@@ -226,6 +250,16 @@ export function addSiteLayers(map: MapLibreMap) {
       },
     });
     map.addLayer({
+      id: "site-envelope-line",
+      type: "line",
+      source: "site-envelope",
+      paint: {
+        "line-color": ["match", ["get", "status"], "existing", "#6c757d", "#c1121f"],
+        "line-width": ["case", ["boolean", ["get", "selected"], false], 2.2, 1.4],
+        "line-dasharray": [3, 2],
+      },
+    });
+    map.addLayer({
       id: "site-structure-fill",
       type: "fill",
       source: "site-structure",
@@ -267,6 +301,8 @@ export function addSiteLayers(map: MapLibreMap) {
           "#0077b6",
           "septic",
           "#9c6644",
+          "front_door",
+          "#c9a227",
           "#333",
         ],
         "circle-stroke-color": "#fff",
@@ -289,7 +325,14 @@ export function addSiteLayers(map: MapLibreMap) {
 }
 
 export function clearSiteLayers(map: MapLibreMap) {
-  for (const id of ["site-parcel", "site-setback", "site-edges", "site-structure", "site-points"]) {
+  for (const id of [
+    "site-parcel",
+    "site-setback",
+    "site-edges",
+    "site-envelope",
+    "site-structure",
+    "site-points",
+  ]) {
     setSrc(map, id, empty());
   }
 }
@@ -313,6 +356,7 @@ function resetFormDefaults() {
   site.widthFt = 40;
   site.lengthFt = 60;
   site.rotationDeg = 0;
+  site.eaveFt = DEFAULT_EAVE_FT;
   site.status = "proposed";
   site.zoning = null;
   site.rule = ruleForZone(null);
@@ -351,10 +395,12 @@ export function startSitePlan(
       site.widthFt = selected.props.widthFt ?? 40;
       site.lengthFt = selected.props.lengthFt ?? 60;
       site.rotationDeg = selected.props.rotationDeg ?? 0;
+      site.eaveFt = selected.props.eaveFt ?? DEFAULT_EAVE_FT;
     } else {
       site.widthFt = 40;
       site.lengthFt = 60;
       site.rotationDeg = 0;
+      site.eaveFt = DEFAULT_EAVE_FT;
     }
   } else {
     site.features = [];
@@ -424,7 +470,8 @@ export function selectedFeature(): PlanFeature | undefined {
 }
 
 export function addFeature(kind: SiteKind, center: Position, extras: Partial<PlanFeature> = {}) {
-  if (!site.geom || !pointInParcel(center, site.geom)) return null;
+  if (!site.geom) return null;
+  if (kind !== "front_door" && !pointInParcel(center, site.geom)) return null;
   const status = extras.status ?? site.status;
   const id = extras.id ?? `${kind}-${Date.now()}`;
   const feature: PlanFeature = {
@@ -436,7 +483,12 @@ export function addFeature(kind: SiteKind, center: Position, extras: Partial<Pla
     onPacket: extras.onPacket ?? true,
     props: {
       ...(kind === "structure"
-        ? { widthFt: site.widthFt, lengthFt: site.lengthFt, rotationDeg: site.rotationDeg }
+        ? {
+            widthFt: site.widthFt,
+            lengthFt: site.lengthFt,
+            rotationDeg: site.rotationDeg,
+            eaveFt: site.eaveFt,
+          }
         : {}),
       source: "user",
       ...extras.props,
@@ -487,15 +539,15 @@ export function refreshOverlays(map: MapLibreMap) {
   const structures = site.features.filter((f) => f.kind === "structure");
   const measured =
     structures.find((f) => f.id === site.selectedId) ?? structures[0];
-  const measuredPoly = measured ? structurePoly(measured) : null;
+  const measuredEnv = measured ? structureEnvelope(measured) : null;
 
   const edges = parcelEdges(site.geom);
   setSrc(map, "site-edges", {
     type: "FeatureCollection",
     features: edges.map((edge) => {
       let label = `${formatFeet(edge.lengthFt)} ${compass(edge.bearing)}`;
-      if (measuredPoly) {
-        const toBldg = minDistToEdgeFt(measuredPoly, edge);
+      if (measuredEnv) {
+        const toBldg = minDistToEdgeFt(measuredEnv, edge);
         label = `${formatFeet(edge.lengthFt)} · ${formatFeet(toBldg)} to bldg`;
       }
       return {
@@ -503,6 +555,25 @@ export function refreshOverlays(map: MapLibreMap) {
         properties: { label },
         geometry: { type: "LineString" as const, coordinates: [edge.start, edge.end] },
       };
+    }),
+  });
+
+  setSrc(map, "site-envelope", {
+    type: "FeatureCollection",
+    features: structures.flatMap((feature) => {
+      if (structureEaveFt(feature) <= 0) return [];
+      const env = structureEnvelope(feature);
+      if (!env) return [];
+      return [
+        {
+          ...env,
+          properties: {
+            id: feature.id,
+            status: feature.status,
+            selected: feature.id === site.selectedId,
+          },
+        },
+      ];
     }),
   });
 
@@ -528,7 +599,7 @@ export function refreshOverlays(map: MapLibreMap) {
   setSrc(map, "site-points", {
     type: "FeatureCollection",
     features: site.features
-      .filter((f) => f.kind === "well" || f.kind === "septic")
+      .filter((f) => f.kind === "well" || f.kind === "septic" || f.kind === "front_door")
       .flatMap((f): Feature<Point>[] => {
         const center = featureCenter(f);
         if (!center) return [];
@@ -553,7 +624,7 @@ function pickFeatureAt(lngLat: Position): PlanFeature | null {
   for (let i = site.features.length - 1; i >= 0; i--) {
     const feature = site.features[i];
     if (feature.kind !== "structure") continue;
-    const poly = structurePoly(feature);
+    const poly = structureEnvelope(feature) ?? structurePoly(feature);
     if (poly && pointInParcel(lngLat, poly.geometry)) return feature;
   }
   let best: PlanFeature | null = null;
@@ -571,8 +642,29 @@ function pickFeatureAt(lngLat: Position): PlanFeature | null {
   return best;
 }
 
+function placeFrontDoor(lngLat: Position) {
+  const structures = site.features.filter((f) => f.kind === "structure");
+  const target = structures.find((f) => f.id === site.selectedId) ?? structures[0];
+  const envelope = target ? structureEnvelope(target) : null;
+  if (!envelope) return null;
+  const snap = nearestOnPolygonFt(lngLat, envelope);
+  if (!Number.isFinite(snap.distFt) || snap.distFt > DOOR_SNAP_FT) return null;
+  return addFeature("front_door", snap.point, { label: "Front door" });
+}
+
 export function handleSiteClick(map: MapLibreMap, lngLat: Position) {
   if (!site.active) return false;
+  if (site.placeMode === "front_door") {
+    const feature = placeFrontDoor(lngLat);
+    if (!feature) {
+      const el = document.getElementById("status");
+      if (el) el.textContent = DOOR_REJECT_MSG;
+      return true;
+    }
+    site.placeMode = null;
+    refreshOverlays(map);
+    return true;
+  }
   if (site.placeMode) {
     const feature = addFeature(site.placeMode, lngLat);
     site.placeMode = null;
@@ -587,18 +679,36 @@ export function handleSiteClick(map: MapLibreMap, lngLat: Position) {
   return true;
 }
 
-export function distanceSummary() {
+export interface DistanceRow {
+  structureId: string;
+  structureLabel: string;
+  side: string;
+  lotFt: number;
+  toBldgFt: number;
+}
+
+/** Envelope → every outer-ring lot edge. Packet uses `{ all: true }`; inspector uses selected. */
+export function distanceSummary(opts?: { structureId?: string; all?: boolean }): DistanceRow[] {
   if (!site.geom) return [];
   const structures = site.features.filter((f) => f.kind === "structure");
-  const structure = structures.find((f) => f.id === site.selectedId) ?? structures[0];
-  const poly = structure ? structurePoly(structure) : null;
-  if (!poly) return [];
-  return parcelEdges(site.geom)
-    .filter((e) => e.lengthFt >= 15)
-    .map((edge) => ({
-      side: compass(edge.bearing + 90),
-      lotFt: edge.lengthFt,
-      toBldgFt: minDistToEdgeFt(poly, edge),
-    }))
-    .sort((a, b) => a.toBldgFt - b.toBldgFt);
+  const wantedId = opts?.structureId ?? site.selectedId;
+  const selectedStruct = structures.find((f) => f.id === wantedId);
+  const targets = opts?.all ? structures : selectedStruct ? [selectedStruct] : structures.slice(0, 1);
+  const edges = parcelEdges(site.geom);
+  const rows: DistanceRow[] = [];
+  for (const structure of targets) {
+    const envelope = structureEnvelope(structure);
+    if (!envelope) continue;
+    const chunk = edges
+      .map((edge) => ({
+        structureId: structure.id,
+        structureLabel: structure.label,
+        side: compass(edge.bearing + 90),
+        lotFt: edge.lengthFt,
+        toBldgFt: minDistToEdgeFt(envelope, edge),
+      }))
+      .sort((a, b) => a.toBldgFt - b.toBldgFt);
+    rows.push(...chunk);
+  }
+  return rows;
 }

@@ -17,6 +17,7 @@ import {
   type BasemapId,
 } from "./map";
 import {
+  DEFAULT_EAVE_FT,
   distanceSummary,
   exitSitePlan,
   handleSiteClick,
@@ -29,6 +30,7 @@ import {
   site,
   startSitePlan,
   updateSelected,
+  type SiteKind,
 } from "./siteplan";
 import { formatFeet } from "./geo";
 import type { Polygon, MultiPolygon } from "geojson";
@@ -97,7 +99,7 @@ function renderDistances() {
   for (const row of rows.slice(0, 8)) {
     const li = document.createElement("li");
     const ok = row.toBldgFt + 0.5 >= site.lineFt;
-    li.textContent = `${row.side} line ${formatFeet(row.lotFt)} · ${formatFeet(row.toBldgFt)} to structure${ok ? "" : " — short of setback"}`;
+    li.textContent = `${row.side} line ${formatFeet(row.lotFt)} · ${formatFeet(row.toBldgFt)} to projection${ok ? "" : " — short of setback"}`;
     if (!ok) li.style.color = "#ffb4a6";
     list.append(li);
   }
@@ -118,9 +120,8 @@ function fillPrintBlock() {
   ]
     .filter(Boolean)
     .join("  ·  ");
-  $("print-measures").textContent = distanceSummary()
-    .slice(0, 8)
-    .map((row) => `${row.side}: ${formatFeet(row.toBldgFt)} to structure`)
+  $("print-measures").textContent = distanceSummary({ all: true })
+    .map((row) => `${row.structureLabel} · ${row.side}: ${formatFeet(row.toBldgFt)} to projection`)
     .join("   ");
   $("print-notes").textContent = site.notes;
 }
@@ -136,10 +137,12 @@ function syncSiteForm() {
     if (selected.props.widthFt != null) site.widthFt = selected.props.widthFt;
     if (selected.props.lengthFt != null) site.lengthFt = selected.props.lengthFt;
     if (selected.props.rotationDeg != null) site.rotationDeg = selected.props.rotationDeg;
+    if (selected.props.eaveFt != null) site.eaveFt = selected.props.eaveFt;
   }
   $<HTMLInputElement>("site-width").value = String(site.widthFt);
   $<HTMLInputElement>("site-length").value = String(site.lengthFt);
   $<HTMLInputElement>("site-rot").value = String(site.rotationDeg);
+  $<HTMLInputElement>("site-eave").value = String(site.eaveFt);
 }
 
 function fillZoneHint() {
@@ -190,6 +193,7 @@ function bindSitePlan(map: MapLibreMap) {
   const width = $<HTMLInputElement>("site-width");
   const length = $<HTMLInputElement>("site-length");
   const rot = $<HTMLInputElement>("site-rot");
+  const eave = $<HTMLInputElement>("site-eave");
   const existing = $<HTMLInputElement>("site-existing");
 
   setback.addEventListener("change", () => {
@@ -207,6 +211,8 @@ function bindSitePlan(map: MapLibreMap) {
     site.widthFt = Number(width.value) || 40;
     site.lengthFt = Number(length.value) || 60;
     site.rotationDeg = Number(rot.value) || 0;
+    const eaveN = Number(eave.value);
+    site.eaveFt = Number.isFinite(eaveN) && eaveN >= 0 ? eaveN : DEFAULT_EAVE_FT;
   };
   const syncSize = () => {
     readSize();
@@ -214,6 +220,7 @@ function bindSitePlan(map: MapLibreMap) {
       widthFt: site.widthFt,
       lengthFt: site.lengthFt,
       rotationDeg: site.rotationDeg,
+      eaveFt: site.eaveFt,
     });
     refreshOverlays(map);
     renderDistances();
@@ -221,9 +228,11 @@ function bindSitePlan(map: MapLibreMap) {
   width.addEventListener("input", readSize);
   length.addEventListener("input", readSize);
   rot.addEventListener("input", readSize);
+  eave.addEventListener("input", readSize);
   width.addEventListener("change", syncSize);
   length.addEventListener("change", syncSize);
   rot.addEventListener("change", syncSize);
+  eave.addEventListener("change", syncSize);
   existing.addEventListener("change", () => {
     site.status = existing.checked ? "existing" : "proposed";
     updateSelected({ status: site.status });
@@ -239,19 +248,24 @@ function bindSitePlan(map: MapLibreMap) {
     schedulePersist();
   });
 
-  const arm = (id: string, mode: "structure" | "well" | "septic") => {
+  const arm = (id: string, mode: SiteKind) => {
     $(id).addEventListener("click", () => {
       site.placeMode = mode;
       for (const btn of document.querySelectorAll(".btn-row .ghost")) {
         btn.classList.toggle("active", btn.id === id);
       }
       $("status").textContent =
-        mode === "structure" ? "Tap the lot to place a structure" : `Tap the lot to place the ${mode}`;
+        mode === "structure"
+          ? "Tap the lot to place a structure"
+          : mode === "front_door"
+            ? "Tap the building edge to place the front door"
+            : `Tap the lot to place the ${mode}`;
     });
   };
   arm("place-structure", "structure");
   arm("place-well", "well");
   arm("place-septic", "septic");
+  arm("place-door", "front_door");
 
   $("print-sitemap").addEventListener("click", () => {
     fillPrintBlock();
@@ -476,10 +490,13 @@ async function boot() {
       if (site.active) {
         const placing = site.placeMode;
         if (handleSiteClick(map, [event.lngLat.lng, event.lngLat.lat])) {
+          if (site.placeMode) return;
           for (const btn of document.querySelectorAll(".btn-row .ghost")) btn.classList.remove("active");
           syncSiteForm();
           renderDistances();
-          if (placing) {
+          if (placing === "front_door") {
+            $("status").textContent = "Front door placed";
+          } else if (placing) {
             $("status").textContent = site.features.some((f) => f.kind === "structure")
               ? "Structure placed · print when the distances look right"
               : "Placed · add the structure to measure setbacks";

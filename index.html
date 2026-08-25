@@ -122,6 +122,9 @@
           <label>Rotation
             <input id="site-rot" type="number" step="5" value="0" />
           </label>
+          <label>Eave (ft)
+            <input id="site-eave" type="number" min="0" step="0.5" value="2" />
+          </label>
           <label class="check">
             <input id="site-existing" type="checkbox" /> Existing
           </label>
@@ -130,16 +133,22 @@
           <button id="place-structure" type="button" class="ghost">Place structure</button>
           <button id="place-well" type="button" class="ghost">Well</button>
           <button id="place-septic" type="button" class="ghost">Septic</button>
+          <button id="place-door" type="button" class="ghost">Place door</button>
         </div>
         <ul id="site-distances" class="measures"></ul>
+        <p class="hint">
+          Distances are from greatest projections (eaves/decks), approximate from the
+          assessor map.
+        </p>
         <label>Notes
           <textarea id="site-notes" rows="2" placeholder="Driveway, shoreline, slope, wetlands, existing buildings…"></textarea>
         </label>
         <button id="print-sitemap" class="primary">Print / save PDF</button>
         <p class="disclaimer">
           Draft only. BCRC 11-105 requires distances from the structure’s greatest
-          projections to every property line and environmental features. Confirm setbacks
-          in Tables 12-411 / 12-412. This is not a survey.
+          projections to every property line and environmental features. Architectural
+          projections cannot enter the setback. Confirm setbacks in Tables 12-411 /
+          12-412. This is not a survey.
         </p>
       </section>
 
@@ -149,10 +158,11 @@
         <p id="print-measures"></p>
         <p id="print-notes"></p>
         <p class="print-disclaimer">
-          Assessor parcel map, not a land survey. Distances are approximate. Confirm
-          setbacks, floodplain, shorelines, and wetlands with Bonner County Planning
-          (208-265-1458) before construction. Official application:
-          bonnercountyid.gov/building-location-permit
+          Assessor parcel map, not a land survey. Distances are from greatest
+          projections (eaves/decks) and are approximate. Architectural projections
+          cannot enter the setback. Confirm setbacks, floodplain, shorelines, and
+          wetlands with Bonner County Planning (208-265-1458) before construction.
+          Official application: bonnercountyid.gov/building-location-permit
         </p>
       </aside>
 
