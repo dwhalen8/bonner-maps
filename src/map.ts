@@ -1,6 +1,12 @@
 import maplibregl from "maplibre-gl";
+import type { FeatureCollection } from "geojson";
 import type { ParcelProps } from "./types";
 import { COUNTY_BOUNDS, COUNTY_CENTER } from "./types";
+import {
+  constraintSourceData,
+  emptyConstraintSources,
+  type ConstraintClip,
+} from "./constraints";
 
 export type BasemapId = "hybrid" | "satellite" | "topo" | "dark";
 
@@ -371,4 +377,215 @@ export function updateLocation(map: maplibregl.Map, lng: number, lat: number) {
       },
     ],
   });
+}
+
+const emptyFc = (): FeatureCollection => ({ type: "FeatureCollection", features: [] });
+
+export const CONSTRAINT_SOURCE_IDS = [
+  "constraint-zoning",
+  "constraint-city",
+  "constraint-flood",
+  "constraint-wetlands",
+  "constraint-wetland-setback",
+  "constraint-roads",
+  "constraint-driveways",
+  "constraint-row",
+  "constraint-water",
+  "constraint-shoreline",
+] as const;
+
+/** Checkbox id suffix → map layers. Zoning fill / city impact stay on during site plan. */
+export const CONSTRAINT_TOGGLES: Record<string, string[]> = {
+  flood: ["constraint-flood-fill", "constraint-flood-line"],
+  wetlands: [
+    "constraint-wetlands-fill",
+    "constraint-wetlands-line",
+    "constraint-wetland-setback-fill",
+    "constraint-wetland-setback-line",
+    "constraint-wetland-setback-label",
+  ],
+  roads: ["constraint-roads-line", "constraint-driveways-line"],
+  row: ["constraint-row-fill", "constraint-row-line"],
+  shoreline: ["constraint-shoreline-fill", "constraint-shoreline-line", "constraint-shoreline-label"],
+  water: ["constraint-water-fill", "constraint-water-line"],
+};
+
+function setConstraintSrc(map: maplibregl.Map, id: string, data: FeatureCollection) {
+  const src = map.getSource(id) as maplibregl.GeoJSONSource | undefined;
+  src?.setData(data);
+}
+
+export function addConstraintLayers(map: maplibregl.Map) {
+  for (const id of CONSTRAINT_SOURCE_IDS) {
+    if (map.getSource(id)) continue;
+    map.addSource(id, { type: "geojson", data: emptyFc() });
+  }
+
+  if (!map.getLayer("constraint-flood-fill")) {
+    const before = map.getLayer("site-structure-fill") ? "site-structure-fill" : undefined;
+    const add = (layer: maplibregl.AddLayerObject) => {
+      map.addLayer(layer, before);
+    };
+
+    add({
+    id: "constraint-zoning-fill",
+    type: "fill",
+    source: "constraint-zoning",
+    paint: { "fill-color": "#9b5de5", "fill-opacity": 0.08 },
+    });
+    add({
+    id: "constraint-city-fill",
+    type: "fill",
+    source: "constraint-city",
+    paint: { "fill-color": "#d4b46a", "fill-opacity": 0.1 },
+    });
+    add({
+    id: "constraint-city-line",
+    type: "line",
+    source: "constraint-city",
+    paint: { "line-color": "#d4b46a", "line-width": 1.6, "line-dasharray": [3, 2] },
+    });
+    add({
+    id: "constraint-flood-fill",
+    type: "fill",
+    source: "constraint-flood",
+    paint: {
+      "fill-color": [
+        "match",
+        ["coalesce", ["get", "FLD_ZONE"], ""],
+        "X",
+        "#90e0ef",
+        "AE",
+        "#0077b6",
+        "A",
+        "#00b4d8",
+        "VE",
+        "#023e8a",
+        "#0077b6",
+      ],
+      "fill-opacity": 0.28,
+    },
+    });
+    add({
+    id: "constraint-flood-line",
+    type: "line",
+    source: "constraint-flood",
+    paint: { "line-color": "#0077b6", "line-width": 1.2 },
+    });
+    add({
+    id: "constraint-wetlands-fill",
+    type: "fill",
+    source: "constraint-wetlands",
+    paint: { "fill-color": "#40916c", "fill-opacity": 0.3 },
+    });
+    add({
+    id: "constraint-wetlands-line",
+    type: "line",
+    source: "constraint-wetlands",
+    paint: { "line-color": "#1b4332", "line-width": 1 },
+    });
+    add({
+    id: "constraint-wetland-setback-fill",
+    type: "fill",
+    source: "constraint-wetland-setback",
+    paint: { "fill-color": "#95d5b2", "fill-opacity": 0.08 },
+    });
+    add({
+    id: "constraint-wetland-setback-line",
+    type: "line",
+    source: "constraint-wetland-setback",
+    paint: { "line-color": "#2d6a4f", "line-width": 1.4, "line-dasharray": [3, 2] },
+    });
+    add({
+    id: "constraint-wetland-setback-label",
+    type: "symbol",
+    source: "constraint-wetland-setback",
+    minzoom: 15,
+    layout: {
+      "text-field": "verify with Planning",
+      "text-size": 10,
+      "text-font": ["Noto Sans Regular"],
+      "text-max-width": 12,
+    },
+    paint: { "text-color": "#1b4332", "text-halo-color": "#fff", "text-halo-width": 1.2 },
+    });
+    add({
+    id: "constraint-row-fill",
+    type: "fill",
+    source: "constraint-row",
+    paint: { "fill-color": "#c77dff", "fill-opacity": 0.22 },
+    });
+    add({
+    id: "constraint-row-line",
+    type: "line",
+    source: "constraint-row",
+    paint: { "line-color": "#7b2cbf", "line-width": 1.4 },
+    });
+    add({
+    id: "constraint-water-fill",
+    type: "fill",
+    source: "constraint-water",
+    paint: { "fill-color": "#0077b6", "fill-opacity": 0.28 },
+    });
+    add({
+    id: "constraint-water-line",
+    type: "line",
+    source: "constraint-water",
+    paint: { "line-color": "#023e8a", "line-width": 1.6 },
+    });
+    add({
+    id: "constraint-shoreline-fill",
+    type: "fill",
+    source: "constraint-shoreline",
+    paint: { "fill-color": "#00b4d8", "fill-opacity": 0.07 },
+    });
+    add({
+    id: "constraint-shoreline-line",
+    type: "line",
+    source: "constraint-shoreline",
+    paint: { "line-color": "#0077b6", "line-width": 1.6, "line-dasharray": [4, 2] },
+    });
+    add({
+    id: "constraint-shoreline-label",
+    type: "symbol",
+    source: "constraint-shoreline",
+    minzoom: 15,
+    layout: {
+      "text-field": ["concat", ["to-string", ["get", "setbackFt"]], " ft shoreline"],
+      "text-size": 10,
+      "text-font": ["Noto Sans Regular"],
+    },
+    paint: { "text-color": "#023e8a", "text-halo-color": "#fff", "text-halo-width": 1.2 },
+    });
+    add({
+    id: "constraint-roads-line",
+    type: "line",
+    source: "constraint-roads",
+    paint: { "line-color": "#ffd166", "line-width": 2.2 },
+    });
+    add({
+    id: "constraint-driveways-line",
+    type: "line",
+    source: "constraint-driveways",
+    paint: { "line-color": "#c9ada7", "line-width": 1.6, "line-dasharray": [1, 1] },
+    });
+  }
+
+  for (const [key, layerIds] of Object.entries(CONSTRAINT_TOGGLES)) {
+    const input = document.getElementById(`layer-${key}`) as HTMLInputElement | null;
+    const on = input?.checked ?? true;
+    for (const id of layerIds) setLayerVisible(map, id, on);
+  }
+}
+
+export function applyConstraintLayers(map: maplibregl.Map, clip: ConstraintClip | null) {
+  addConstraintLayers(map);
+  const data = clip ? constraintSourceData(clip) : emptyConstraintSources();
+  for (const [id, fc] of Object.entries(data)) {
+    setConstraintSrc(map, id, fc);
+  }
+}
+
+export function clearConstraintLayers(map: maplibregl.Map) {
+  applyConstraintLayers(map, null);
 }
