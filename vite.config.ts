@@ -6,6 +6,11 @@ import { VitePWA } from "vite-plugin-pwa";
 const root = path.dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
+  resolve: {
+    alias: {
+      "@shared/plan": path.join(root, "shared/plan.ts"),
+    },
+  },
   plugins: [
     VitePWA({
       registerType: "autoUpdate",

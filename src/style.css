@@ -257,6 +257,7 @@ dd { margin: 2px 0 0; }
   font: inherit;
 }
 .sheet .check { display: flex; align-items: center; gap: 8px; margin-top: 22px; }
+.sheet .row .check { white-space: nowrap; }
 .btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
 .btn-row .ghost { width: auto; height: 38px; }
 .btn-row .ghost.active { outline: 2px solid var(--gold); }
