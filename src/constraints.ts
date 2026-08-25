@@ -532,7 +532,7 @@ export async function fetchConstraintOverlays(
     cityImpact: emptyClip(),
   };
 
-  const roadParts: LayerClip[] = [];
+  const roadParts: { layer: number; clip: LayerClip }[] = [];
   const waterParts: { layer: 6 | 12; clip: LayerClip }[] = [];
 
   const publish = () => {
@@ -540,9 +540,17 @@ export async function fetchConstraintOverlays(
     onPartial?.(clip);
   };
 
-  const addRoad = (part: LayerClip) => {
-    roadParts.push({ ...part, features: part.features.map(normalizeRoad) });
-    clip.roads = mergeClips(roadParts, fetchedAt);
+  const addRoad = (transLayer: number, part: LayerClip) => {
+    roadParts.push({
+      layer: transLayer,
+      clip: { ...part, features: part.features.map(normalizeRoad) },
+    });
+    // Prefer Transportation/3 centerlines so the merged 200 / 500 KB cap does not drop them.
+    roadParts.sort((a, b) => a.layer - b.layer);
+    clip.roads = mergeClips(
+      roadParts.map((p) => p.clip),
+      fetchedAt,
+    );
   };
 
   const addWater = (nhdLayer: 6 | 12, part: LayerClip) => {
@@ -563,19 +571,19 @@ export async function fetchConstraintOverlays(
     { spec: { url: GIS_LAYERS.driveway, outFields: "Permissions" }, apply: (layer) => { clip.drivewaysCounty = layer; } },
     {
       spec: { url: GIS_LAYERS.roads, outFields: "fullname,fullname_abbr,roadclass", tag: { transLayer: 3 } },
-      apply: addRoad,
+      apply: (layer) => addRoad(3, layer),
     },
     {
       spec: { url: GIS_LAYERS.roadsCounty, outFields: "st_name_full,maint_by", tag: { transLayer: 4 } },
-      apply: addRoad,
+      apply: (layer) => addRoad(4, layer),
     },
     {
       spec: { url: GIS_LAYERS.roadsUsfs, outFields: "name,oper_maint_level", tag: { transLayer: 5 } },
-      apply: addRoad,
+      apply: (layer) => addRoad(5, layer),
     },
     {
       spec: { url: GIS_LAYERS.roadsOwner, outFields: "st_name_full,owned_by", tag: { transLayer: 7 } },
-      apply: addRoad,
+      apply: (layer) => addRoad(7, layer),
     },
     { spec: { url: GIS_LAYERS.zoning, outFields: "zonedesc" }, apply: (layer) => { clip.zoningFill = layer; } },
     { spec: { url: GIS_LAYERS.cityImpact, outFields: "city" }, apply: (layer) => { clip.cityImpact = layer; } },
