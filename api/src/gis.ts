@@ -19,12 +19,23 @@ import { userFromRequest } from "./auth";
 import type { Db } from "./db";
 
 const GEOM_MAX_BYTES = 1_000_000;
+const VERTEX_CAP = 8_000;
 const PAGE = 200;
 const FEATURE_CAP = 200;
 const ENCODED_CAP = 500 * 1024;
 const RAW_CAP = 2 * 1024 * 1024;
 const WALL_MS = 8000;
 const OFFSET_DEG = "0.00005";
+const MAX_INFLIGHT = 2;
+
+/** Same box as `src/types.ts` COUNTY_BOUNDS. Pad so parcel⊕300 ft on the line still intersects. */
+const COUNTY_WEST = -117.05;
+const COUNTY_SOUTH = 47.88;
+const COUNTY_EAST = -116.04;
+const COUNTY_NORTH = 48.86;
+const COUNTY_PAD_DEG = 0.02;
+/** ~15–35 mi: large USFS lots, not a county-wide or CONUS query. */
+const MAX_ENVELOPE_DEG = 0.5;
 
 const COUNTY =
   "https://cloudgis.bonnercountyid.gov/server/rest/services/Map_Services";
@@ -128,14 +139,37 @@ function worseReason(
   return REASON_RANK.indexOf(a) <= REASON_RANK.indexOf(b) ? a : b;
 }
 
-function fail(c: Context, status: 400 | 401 | 404 | 413, error: string, code: string) {
+function fail(
+  c: Context,
+  status: 400 | 401 | 404 | 413 | 429,
+  error: string,
+  code: string,
+) {
   return c.json({ error, code }, status);
 }
 
-async function readJson(c: Context): Promise<unknown> {
+const inflightByUser = new Map<string, number>();
+
+function acquireClip(userId: string): boolean {
+  const n = inflightByUser.get(userId) ?? 0;
+  if (n >= MAX_INFLIGHT) return false;
+  inflightByUser.set(userId, n + 1);
+  return true;
+}
+
+function releaseClip(userId: string) {
+  const n = inflightByUser.get(userId) ?? 0;
+  if (n <= 1) inflightByUser.delete(userId);
+  else inflightByUser.set(userId, n - 1);
+}
+
+async function readJsonCapped(c: Context, cap: number): Promise<unknown | "too_large"> {
   try {
-    return await c.req.json();
-  } catch {
+    const text = await readCapped(c.req.raw, cap);
+    if (!text) return null;
+    return JSON.parse(text) as unknown;
+  } catch (err) {
+    if ((err as { truncated?: TruncatedReason }).truncated === "byte_cap") return "too_large";
     return null;
   }
 }
@@ -297,7 +331,10 @@ async function withTimeout<T>(
   }
 }
 
-async function readCapped(res: Response, cap: number): Promise<string> {
+async function readCapped(
+  res: { headers: Headers; body: ReadableStream<Uint8Array> | null; text(): Promise<string> },
+  cap: number,
+): Promise<string> {
   const declared = Number(res.headers.get("content-length") ?? 0);
   if (Number.isFinite(declared) && declared > cap) {
     await res.body?.cancel().catch(() => undefined);
@@ -480,6 +517,30 @@ function geomTooLarge(geom: unknown): boolean {
   }
 }
 
+function vertexCount(geom: Polygon | MultiPolygon): number {
+  if (geom.type === "Polygon") {
+    return geom.coordinates.reduce((n, ring) => n + ring.length, 0);
+  }
+  return geom.coordinates.reduce(
+    (n, poly) => n + poly.reduce((m, ring) => m + ring.length, 0),
+    0,
+  );
+}
+
+function envelopeReject(box: BBox): string | null {
+  const [w, s, e, n] = box;
+  if (![w, s, e, n].every(Number.isFinite) || e < w || n < s) {
+    return "Invalid envelope";
+  }
+  const cw = COUNTY_WEST - COUNTY_PAD_DEG;
+  const cs = COUNTY_SOUTH - COUNTY_PAD_DEG;
+  const ce = COUNTY_EAST + COUNTY_PAD_DEG;
+  const cn = COUNTY_NORTH + COUNTY_PAD_DEG;
+  if (e < cw || w > ce || n < cs || s > cn) return "Envelope is outside Bonner County";
+  if (e - w > MAX_ENVELOPE_DEG || n - s > MAX_ENVELOPE_DEG) return "Envelope is too large";
+  return null;
+}
+
 function rejectOpenRelay(json: unknown): string | null {
   if (!json || typeof json !== "object") return null;
   const body = json as Record<string, unknown>;
@@ -525,7 +586,10 @@ export function mountGis(api: Hono, db: Db): void {
       return fail(c, 401, "Not signed in", "unauthorized");
     }
 
-    const json = await readJson(c);
+    const json = await readJsonCapped(c, GEOM_MAX_BYTES);
+    if (json === "too_large") {
+      return fail(c, 413, "Geometry too large", "payload_too_large");
+    }
     const relay = rejectOpenRelay(json);
     if (relay) return fail(c, 400, relay, "bad_request");
 
@@ -553,12 +617,21 @@ export function mountGis(api: Hono, db: Db): void {
     if (!geom) {
       return fail(c, 400, "Parcel geometry required", "bad_request");
     }
-    if (geomTooLarge(geom)) {
+    if (!hasGeometry(geom)) {
+      return fail(c, 400, "Invalid parcel geometry", "bad_request");
+    }
+    if (vertexCount(geom) > VERTEX_CAP || geomTooLarge(geom)) {
       return fail(c, 413, "Geometry too large", "payload_too_large");
     }
 
     const url = queryUrl(ALLOWLIST[src].base, layer);
     const envelope = envelopeFromParcel(geom);
+    const where = envelopeReject(envelope.bbox);
+    if (where) return fail(c, 400, where, "bad_request");
+
+    if (!acquireClip(user.id)) {
+      return fail(c, 429, "Too many clip requests", "rate_limited");
+    }
     const abort = new AbortController();
     const timer = setTimeout(() => abort.abort(), WALL_MS);
     let clip: LayerClip;
@@ -569,6 +642,7 @@ export function mountGis(api: Hono, db: Db): void {
       return c.json({ error: "Clip failed", code: "clip_failed" }, 500);
     } finally {
       clearTimeout(timer);
+      releaseClip(user.id);
     }
 
     console.log(

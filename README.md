@@ -86,20 +86,23 @@ If the API container is down, nginx still serves `/` and `/data/`. `/api/` is 50
 No self-serve account deletion. Capture the user id **before** the `DELETE FROM users` row.
 
 ```sql
--- :email is the account to erase
-SELECT id FROM users WHERE email = :email COLLATE NOCASE;  -- save :uid for the rm
+-- :email is the account to erase. One transaction; save :uid from SELECT before COMMIT.
+BEGIN;
+SELECT id FROM users WHERE email = :email COLLATE NOCASE;
 DELETE FROM attachments WHERE plan_id IN (
   SELECT id FROM plans WHERE user_id = :uid);
 DELETE FROM plans WHERE user_id = :uid;
 DELETE FROM sessions WHERE user_id = :uid;
 DELETE FROM webauthn_credentials WHERE user_id = :uid;
 DELETE FROM otp_codes WHERE email = :email COLLATE NOCASE;
-DELETE FROM auth_events WHERE key = 'email:' || lower(:email)
-  OR key LIKE 'email:' || lower(:email) || '%';
+DELETE FROM auth_events WHERE key = 'email:' || lower(:email);
 DELETE FROM users WHERE id = :uid;
+COMMIT;
 ```
 
-Then `rm -rf /data/uploads/{uid}` using the **selected** id. Treat `plan-data` as sensitive (email, session hashes, uploaded deeds).
+Live `auth_events` keys are exactly `email:${normalized}` (and unrelated `ip:…` counters). Do **not** `LIKE 'email:' || :email || '%'` — `a@b.c` would match `email:a@b.com`.
+
+Then `rm -rf /data/uploads/{uid}` using the **selected** id. This branch has no upload writer. Design layout for PR 10 is `/data/uploads/{userId}/{id}`; **confirm `attachments.disk_path` is under that prefix** before running `rm` once uploads exist. Treat `plan-data` as sensitive (email, session hashes, uploaded deeds).
 
 ### 3. After it is live
 
