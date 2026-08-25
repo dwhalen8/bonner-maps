@@ -18,7 +18,7 @@ import {
   updateLocation,
   type BasemapId,
 } from "./map";
-import { fetchConstraintOverlays, incompleteConstraintMessage } from "./constraints";
+import { fetchConstraintOverlays, incompleteConstraintMessage, type ConstraintClip } from "./constraints";
 import {
   distanceSummary,
   exitSitePlan,
@@ -158,12 +158,16 @@ async function loadSiteConstraints(map: MapLibreMap, sessionPin: string, geom: P
   const idle = "Site plan · tap Place structure, then tap the lot";
   if (!status.textContent || status.textContent.startsWith("Site plan")) status.textContent = loading;
   try {
-    const clip = await fetchConstraintOverlays(geom, site.zoning);
+    const apply = (clip: ConstraintClip) => {
+      if (!site.active || site.draftPin !== sessionPin) return;
+      site.constraints = clip;
+      if (site.zoning) clip.zoning = { zonedesc: site.zoning, fetchedAt: clip.zoning.fetchedAt };
+      applyConstraintLayers(map, clip);
+      applyConstraintToggles(map);
+    };
+    const clip = await fetchConstraintOverlays(geom, site.zoning, apply);
     if (!site.active || site.draftPin !== sessionPin || !clip) return;
-    site.constraints = clip;
-    if (site.zoning) clip.zoning = { zonedesc: site.zoning, fetchedAt: clip.zoning.fetchedAt };
-    applyConstraintLayers(map, clip);
-    applyConstraintToggles(map);
+    apply(clip);
     const incomplete = incompleteConstraintMessage(clip);
     if (incomplete) {
       status.textContent = incomplete;

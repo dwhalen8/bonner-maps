@@ -211,6 +211,34 @@ function isAbort(err: unknown) {
   return err instanceof DOMException && err.name === "AbortError";
 }
 
+const REASON_RANK: TruncatedReason[] = ["cors", "timeout", "too_large_source", "byte_cap", "feature_cap"];
+
+function worseReason(a?: TruncatedReason, b?: TruncatedReason): TruncatedReason | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  return REASON_RANK.indexOf(a) <= REASON_RANK.indexOf(b) ? a : b;
+}
+
+async function withTimeout<T>(
+  deadline: number,
+  parent: AbortSignal,
+  run: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  if (parent.aborted) throw parent.reason ?? new DOMException("Aborted", "AbortError");
+  const remain = deadline - Date.now();
+  if (remain <= 0) throw new DOMException("Timeout", "AbortError");
+  const local = new AbortController();
+  const timer = window.setTimeout(() => local.abort(), remain);
+  const onParent = () => local.abort();
+  parent.addEventListener("abort", onParent);
+  try {
+    return await run(local.signal);
+  } finally {
+    window.clearTimeout(timer);
+    parent.removeEventListener("abort", onParent);
+  }
+}
+
 async function probeDirect(layerUrl: string, signal: AbortSignal): Promise<"ok" | "cors"> {
   try {
     await fetch(`${layerUrl}?f=json`, { signal });
@@ -280,10 +308,18 @@ async function queryPage(
 
 async function clipLayer(spec: LayerSpec, envelope: QueryEnvelope, signal: AbortSignal): Promise<LayerClip> {
   const fetchedAt = nowIso();
+  // Clock starts at first network attempt (when the worker picks this layer up).
   const deadline = Date.now() + WALL_MS;
   if (spec.federal) {
-    const probe = await probeDirect(spec.url, signal);
-    if (probe === "cors") return emptyClip("cors", { fetchedAt });
+    try {
+      const probe = await withTimeout(deadline, signal, (s) => probeDirect(spec.url, s));
+      if (probe === "cors") return emptyClip("cors", { fetchedAt });
+    } catch (err) {
+      if (signal.aborted) throw err;
+      if (isAbort(err)) return emptyClip("timeout", { fetchedAt });
+      if (isTypeError(err)) return emptyClip("cors", { fetchedAt });
+      throw err;
+    }
   }
 
   const kept: Feature[] = [];
@@ -298,21 +334,10 @@ async function clipLayer(spec: LayerSpec, envelope: QueryEnvelope, signal: Abort
     while (!halt) {
       if (Date.now() > deadline) {
         incomplete = true;
-        truncatedReason = "timeout";
+        truncatedReason = worseReason(truncatedReason, "timeout");
         break;
       }
-      const remain = Math.max(1, deadline - Date.now());
-      const pageAbort = new AbortController();
-      const timer = window.setTimeout(() => pageAbort.abort(), remain);
-      const onParent = () => pageAbort.abort();
-      signal.addEventListener("abort", onParent);
-      let page: { text: string; data: EsriFc };
-      try {
-        page = await queryPage(spec, envelope, offset, pageAbort.signal);
-      } finally {
-        window.clearTimeout(timer);
-        signal.removeEventListener("abort", onParent);
-      }
+      const page = await withTimeout(deadline, signal, (s) => queryPage(spec, envelope, offset, s));
 
       rawBytes += page.text.length;
       const incoming = page.data.features ?? [];
@@ -326,14 +351,14 @@ async function clipLayer(spec: LayerSpec, envelope: QueryEnvelope, signal: Abort
           kept.push(clipped);
           if (kept.length >= FEATURE_CAP) {
             incomplete = true;
-            truncatedReason = "feature_cap";
+            truncatedReason = worseReason(truncatedReason, "feature_cap");
             halt = true;
             break;
           }
           if (JSON.stringify(kept).length >= ENCODED_CAP) {
             kept.pop();
             incomplete = true;
-            truncatedReason = "byte_cap";
+            truncatedReason = worseReason(truncatedReason, "byte_cap");
             halt = true;
             break;
           }
@@ -345,7 +370,7 @@ async function clipLayer(spec: LayerSpec, envelope: QueryEnvelope, signal: Abort
       if (halt) break;
       if (rawBytes >= RAW_CAP) {
         incomplete = true;
-        truncatedReason = "byte_cap";
+        truncatedReason = worseReason(truncatedReason, "byte_cap");
         break;
       }
       const more = incoming.length >= PAGE || transferLimit(page.data);
@@ -356,7 +381,7 @@ async function clipLayer(spec: LayerSpec, envelope: QueryEnvelope, signal: Abort
     if (isAbort(err) || signal.aborted) {
       if (!signal.aborted) {
         incomplete = true;
-        truncatedReason = "timeout";
+        truncatedReason = worseReason(truncatedReason, "timeout");
       } else throw err;
     } else if (isTypeError(err)) {
       return emptyClip("cors", { fetchedAt, features: kept, incomplete: true });
@@ -365,7 +390,7 @@ async function clipLayer(spec: LayerSpec, envelope: QueryEnvelope, signal: Abort
     }
   }
 
-  if (skipThrows && !truncatedReason && envelope.incomplete) truncatedReason = "too_large_source";
+  if (skipThrows) incomplete = true;
 
   return {
     type: "FeatureCollection",
@@ -376,21 +401,31 @@ async function clipLayer(spec: LayerSpec, envelope: QueryEnvelope, signal: Abort
   };
 }
 
+function capClip(clip: LayerClip): LayerClip {
+  let { features, incomplete, truncatedReason, fetchedAt } = clip;
+  if (features.length > FEATURE_CAP) {
+    features = features.slice(0, FEATURE_CAP);
+    incomplete = true;
+    truncatedReason = worseReason(truncatedReason, "feature_cap");
+  }
+  while (features.length && JSON.stringify(features).length >= ENCODED_CAP) {
+    features = features.slice(0, -1);
+    incomplete = true;
+    truncatedReason = worseReason(truncatedReason, "byte_cap");
+  }
+  return { type: "FeatureCollection", features, incomplete, fetchedAt, truncatedReason };
+}
+
 function mergeClips(parts: LayerClip[], fetchedAt: string): LayerClip {
   const features: Feature[] = [];
   let incomplete = false;
   let truncatedReason: TruncatedReason | undefined;
-  const rank: TruncatedReason[] = ["cors", "timeout", "too_large_source", "byte_cap", "feature_cap"];
   for (const part of parts) {
     features.push(...part.features);
     if (part.incomplete) incomplete = true;
-    if (part.truncatedReason) {
-      if (!truncatedReason || rank.indexOf(part.truncatedReason) < rank.indexOf(truncatedReason)) {
-        truncatedReason = part.truncatedReason;
-      }
-    }
+    truncatedReason = worseReason(truncatedReason, part.truncatedReason);
   }
-  return { type: "FeatureCollection", features, incomplete, fetchedAt, truncatedReason };
+  return capClip({ type: "FeatureCollection", features, incomplete, fetchedAt, truncatedReason });
 }
 
 function normalizeNhd(feature: Feature, layer: 6 | 12): Feature {
@@ -440,9 +475,42 @@ export function cancelConstraintOverlays() {
   activeAbort = null;
 }
 
+interface ClipJob {
+  spec: LayerSpec;
+  apply: (layer: LayerClip) => void;
+}
+
+async function runJobs(
+  jobs: ClipJob[],
+  limit: number,
+  envelope: QueryEnvelope,
+  signal: AbortSignal,
+  gen: number,
+) {
+  let next = 0;
+  const worker = async () => {
+    for (;;) {
+      const idx = next++;
+      if (idx >= jobs.length) return;
+      if (gen !== generation || signal.aborted) return;
+      const job = jobs[idx];
+      try {
+        const layer = await clipLayer(job.spec, envelope, signal);
+        if (gen !== generation) return;
+        job.apply(layer);
+      } catch {
+        if (gen !== generation || signal.aborted) return;
+        job.apply(emptyClip(undefined, { incomplete: true, fetchedAt: nowIso() }));
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, jobs.length) }, () => worker()));
+}
+
 export async function fetchConstraintOverlays(
   geom: Polygon | MultiPolygon,
   zoningLabel: string | null = null,
+  onPartial?: (clip: ConstraintClip) => void,
 ): Promise<ConstraintClip | null> {
   const gen = ++generation;
   activeAbort?.abort();
@@ -452,76 +520,99 @@ export async function fetchConstraintOverlays(
   const { signal } = abort;
   const fetchedAt = nowIso();
 
-  const run = (spec: LayerSpec) => clipLayer(spec, envelope, signal);
+  const clip: ConstraintClip = {
+    zoning: { zonedesc: zoningLabel, fetchedAt },
+    zoningFill: emptyClip(),
+    roads: emptyClip(),
+    drivewaysCounty: emptyClip(),
+    row: emptyClip(),
+    flood: emptyClip(),
+    wetlands: emptyClip(),
+    water: emptyClip(),
+    cityImpact: emptyClip(),
+  };
 
-  try {
-    const [
-      row,
-      drivewaysCounty,
-      roads3,
-      roads4,
-      roads5,
-      roads7,
-      zoningFill,
-      cityImpact,
-      flood,
-      wetlandsRaw,
-      flowline,
-      waterbody,
-    ] = await Promise.all([
-      run({ url: GIS_LAYERS.row, outFields: "objectid" }),
-      run({ url: GIS_LAYERS.driveway, outFields: "Permissions" }),
-      run({ url: GIS_LAYERS.roads, outFields: "fullname,fullname_abbr,roadclass", tag: { transLayer: 3 } }),
-      run({ url: GIS_LAYERS.roadsCounty, outFields: "st_name_full,maint_by", tag: { transLayer: 4 } }),
-      run({ url: GIS_LAYERS.roadsUsfs, outFields: "name,oper_maint_level", tag: { transLayer: 5 } }),
-      run({ url: GIS_LAYERS.roadsOwner, outFields: "st_name_full,owned_by", tag: { transLayer: 7 } }),
-      run({ url: GIS_LAYERS.zoning, outFields: "zonedesc" }),
-      run({ url: GIS_LAYERS.cityImpact, outFields: "city" }),
-      run({ url: GIS_LAYERS.nfhl, outFields: "FLD_ZONE,ZONE_SUBTY", federal: true }),
-      run({ url: GIS_LAYERS.nwi, outFields: "Wetlands.WETLAND_TYPE,Wetlands.ATTRIBUTE", federal: true }),
-      run({
-        url: GIS_LAYERS.nhdFlowline,
-        outFields: "gnis_name,FCODE,FTYPE",
-        federal: true,
-        tag: { nhdLayer: 6 },
-      }),
-      run({
-        url: GIS_LAYERS.nhdWaterbody,
-        outFields: "gnis_name,FCODE,FTYPE",
-        federal: true,
-        tag: { nhdLayer: 12 },
-      }),
-    ]);
+  const roadParts: LayerClip[] = [];
+  const waterParts: { layer: 6 | 12; clip: LayerClip }[] = [];
 
-    if (gen !== generation) return null;
+  const publish = () => {
+    if (gen !== generation) return;
+    onPartial?.(clip);
+  };
 
-    const wetlands: LayerClip = {
-      ...wetlandsRaw,
-      features: wetlandsRaw.features.map(normalizeNwi),
-    };
-    const water = mergeClips(
-      [
-        { ...flowline, features: flowline.features.map((f) => normalizeNhd(f, 6)) },
-        { ...waterbody, features: waterbody.features.map((f) => normalizeNhd(f, 12)) },
-      ],
+  const addRoad = (part: LayerClip) => {
+    roadParts.push({ ...part, features: part.features.map(normalizeRoad) });
+    clip.roads = mergeClips(roadParts, fetchedAt);
+  };
+
+  const addWater = (nhdLayer: 6 | 12, part: LayerClip) => {
+    waterParts.push({
+      layer: nhdLayer,
+      clip: { ...part, features: part.features.map((f) => normalizeNhd(f, nhdLayer)) },
+    });
+    // Prefer waterbodies (12) so shoreline 40 ft lakes survive the merged cap.
+    waterParts.sort((a, b) => b.layer - a.layer);
+    clip.water = mergeClips(
+      waterParts.map((p) => p.clip),
       fetchedAt,
     );
-    const roads: LayerClip = {
-      ...roads3,
-      features: [roads3, roads4, roads5, roads7].flatMap((part) => part.features.map(normalizeRoad)),
-    };
+  };
 
-    return {
-      zoning: { zonedesc: zoningLabel, fetchedAt },
-      zoningFill,
-      roads,
-      drivewaysCounty,
-      row,
-      flood,
-      wetlands,
-      water,
-      cityImpact,
+  const county: ClipJob[] = [
+    { spec: { url: GIS_LAYERS.row, outFields: "objectid" }, apply: (layer) => { clip.row = layer; } },
+    { spec: { url: GIS_LAYERS.driveway, outFields: "Permissions" }, apply: (layer) => { clip.drivewaysCounty = layer; } },
+    {
+      spec: { url: GIS_LAYERS.roads, outFields: "fullname,fullname_abbr,roadclass", tag: { transLayer: 3 } },
+      apply: addRoad,
+    },
+    {
+      spec: { url: GIS_LAYERS.roadsCounty, outFields: "st_name_full,maint_by", tag: { transLayer: 4 } },
+      apply: addRoad,
+    },
+    {
+      spec: { url: GIS_LAYERS.roadsUsfs, outFields: "name,oper_maint_level", tag: { transLayer: 5 } },
+      apply: addRoad,
+    },
+    {
+      spec: { url: GIS_LAYERS.roadsOwner, outFields: "st_name_full,owned_by", tag: { transLayer: 7 } },
+      apply: addRoad,
+    },
+    { spec: { url: GIS_LAYERS.zoning, outFields: "zonedesc" }, apply: (layer) => { clip.zoningFill = layer; } },
+    { spec: { url: GIS_LAYERS.cityImpact, outFields: "city" }, apply: (layer) => { clip.cityImpact = layer; } },
+  ];
+
+  const federal: ClipJob[] = [
+    {
+      spec: { url: GIS_LAYERS.nfhl, outFields: "FLD_ZONE,ZONE_SUBTY", federal: true },
+      apply: (layer) => { clip.flood = layer; },
+    },
+    {
+      spec: { url: GIS_LAYERS.nwi, outFields: "Wetlands.WETLAND_TYPE,Wetlands.ATTRIBUTE", federal: true },
+      apply: (layer) => { clip.wetlands = { ...layer, features: layer.features.map(normalizeNwi) }; },
+    },
+    {
+      spec: { url: GIS_LAYERS.nhdWaterbody, outFields: "gnis_name,FCODE,FTYPE", federal: true, tag: { nhdLayer: 12 } },
+      apply: (layer) => addWater(12, layer),
+    },
+    {
+      spec: { url: GIS_LAYERS.nhdFlowline, outFields: "gnis_name,FCODE,FTYPE", federal: true, tag: { nhdLayer: 6 } },
+      apply: (layer) => addWater(6, layer),
+    },
+  ];
+
+  for (const job of [...county, ...federal]) {
+    const apply = job.apply;
+    job.apply = (layer) => {
+      apply(layer);
+      publish();
     };
+  }
+
+  try {
+    // County shares one host (~6 connections). Cap concurrency; 8 s clock starts per job.
+    await Promise.all([runJobs(county, 3, envelope, signal, gen), runJobs(federal, 4, envelope, signal, gen)]);
+    if (gen !== generation) return null;
+    return clip;
   } catch (err) {
     if (gen !== generation || signal.aborted) return null;
     throw err;
@@ -583,7 +674,7 @@ export function incompleteConstraintMessage(clip: ConstraintClip): string | null
   ];
   const parts = rows
     .filter(([, layer]) => layer.incomplete)
-    .map(([name, layer]) => (layer.truncatedReason ? `${name} (${layer.truncatedReason})` : name));
+    .map(([name, layer]) => `${name} (${layer.truncatedReason ?? "error"})`);
   if (!parts.length) return null;
   return `Constraint overlays incomplete: ${parts.join(", ")}`;
 }
