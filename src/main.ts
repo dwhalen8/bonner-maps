@@ -23,7 +23,10 @@ import {
   exitSitePlan,
   handleSiteClick,
   refreshOverlays,
+  refreshSiteZoning,
   removeSelected,
+  schedulePersist,
+  selectedFeature,
   setLineSetback,
   site,
   startSitePlan,
@@ -55,7 +58,12 @@ function acres(value: number) {
   return `${value.toLocaleString(undefined, { maximumFractionDigits: 2 })} ac`;
 }
 
-function showParcel(props: ParcelProps) {
+function showParcel(map: MapLibreMap, props: ParcelProps) {
+  if (site.active) {
+    $("siteplan-panel").hidden = true;
+    exitSitePlan(map);
+    syncSiteForm();
+  }
   site.parcel = props;
   $("layers-panel").hidden = true;
   const card = $("parcel-card");
@@ -119,16 +127,44 @@ function fillPrintBlock() {
   $("print-notes").textContent = site.notes;
 }
 
+function syncSiteForm() {
+  $<HTMLInputElement>("site-use").value = site.use;
+  $<HTMLTextAreaElement>("site-notes").value = site.notes;
+  $<HTMLInputElement>("site-accessory").checked = site.accessory;
+  $<HTMLInputElement>("site-setback").value = String(site.lineFt);
+  const selected = selectedFeature();
+  $<HTMLInputElement>("site-existing").checked = (selected?.status ?? site.status) === "existing";
+  if (selected?.kind === "structure") {
+    if (selected.props.widthFt != null) site.widthFt = selected.props.widthFt;
+    if (selected.props.lengthFt != null) site.lengthFt = selected.props.lengthFt;
+    if (selected.props.rotationDeg != null) site.rotationDeg = selected.props.rotationDeg;
+  }
+  $<HTMLInputElement>("site-width").value = String(site.widthFt);
+  $<HTMLInputElement>("site-length").value = String(site.lengthFt);
+  $<HTMLInputElement>("site-rot").value = String(site.rotationDeg);
+}
+
+function fillZoneHint() {
+  $("site-zone").textContent = site.zoning
+    ? `${site.zoning} · typical setback ${site.rule.lineFt} ft (${site.rule.source})`
+    : `Looking up zoning · using ${site.lineFt} ft until county GIS answers.`;
+}
+
 async function openSitePlan(map: MapLibreMap, props: ParcelProps, geom: Polygon | MultiPolygon) {
   $("parcel-card").hidden = true;
   $("layers-panel").hidden = true;
   $("siteplan-panel").hidden = false;
   $("status").textContent = "Site plan · tap Place structure, then tap the lot";
-  await startSitePlan(map, props, geom);
+  const session = startSitePlan(map, props, geom);
+  fillZoneHint();
+  syncSiteForm();
+  renderDistances();
+  await refreshSiteZoning(map, session);
+  if (!site.active || site.draftPin !== session.pin) return;
   $("site-zone").textContent = site.zoning
     ? `${site.zoning} · typical setback ${site.rule.lineFt} ft (${site.rule.source})`
     : `Zoning unavailable · using ${site.lineFt} ft. Confirm Tables 12-411 / 12-412.`;
-  $<HTMLInputElement>("site-setback").value = String(site.lineFt);
+  syncSiteForm();
   renderDistances();
 }
 
@@ -147,6 +183,7 @@ function bindSitePlan(map: MapLibreMap) {
   $("close-siteplan").addEventListener("click", () => {
     $("siteplan-panel").hidden = true;
     exitSitePlan(map);
+    syncSiteForm();
     highlightParcel(map, null);
   });
 
@@ -155,6 +192,7 @@ function bindSitePlan(map: MapLibreMap) {
   const width = $<HTMLInputElement>("site-width");
   const length = $<HTMLInputElement>("site-length");
   const rot = $<HTMLInputElement>("site-rot");
+  const existing = $<HTMLInputElement>("site-existing");
 
   setback.addEventListener("change", () => {
     setLineSetback(map, Number(setback.value) || 0);
@@ -167,24 +205,40 @@ function bindSitePlan(map: MapLibreMap) {
     setLineSetback(map, feet);
     renderDistances();
   });
+  const readSize = () => {
+    site.widthFt = Number(width.value) || 40;
+    site.lengthFt = Number(length.value) || 60;
+    site.rotationDeg = Number(rot.value) || 0;
+  };
   const syncSize = () => {
+    readSize();
     updateSelected({
-      widthFt: Number(width.value) || 40,
-      lengthFt: Number(length.value) || 60,
-      rotationDeg: Number(rot.value) || 0,
+      widthFt: site.widthFt,
+      lengthFt: site.lengthFt,
+      rotationDeg: site.rotationDeg,
     });
     refreshOverlays(map);
     renderDistances();
   };
+  width.addEventListener("input", readSize);
+  length.addEventListener("input", readSize);
+  rot.addEventListener("input", readSize);
   width.addEventListener("change", syncSize);
   length.addEventListener("change", syncSize);
   rot.addEventListener("change", syncSize);
+  existing.addEventListener("change", () => {
+    site.status = existing.checked ? "existing" : "proposed";
+    updateSelected({ status: site.status });
+    refreshOverlays(map);
+  });
 
   $("site-use").addEventListener("input", (event) => {
     site.use = (event.target as HTMLInputElement).value;
+    schedulePersist();
   });
   $("site-notes").addEventListener("input", (event) => {
     site.notes = (event.target as HTMLTextAreaElement).value;
+    schedulePersist();
   });
 
   const arm = (id: string, mode: "structure" | "well" | "septic") => {
@@ -194,7 +248,7 @@ function bindSitePlan(map: MapLibreMap) {
         btn.classList.toggle("active", btn.id === id);
       }
       $("status").textContent =
-        mode === "structure" ? "Tap the lot to place the structure" : `Tap the lot to place the ${mode}`;
+        mode === "structure" ? "Tap the lot to place a structure" : `Tap the lot to place the ${mode}`;
     });
   };
   arm("place-structure", "structure");
@@ -216,6 +270,7 @@ function bindSitePlan(map: MapLibreMap) {
       removeSelected();
       refreshOverlays(map);
       renderDistances();
+      syncSiteForm();
     }
   });
 }
@@ -247,7 +302,7 @@ function bindSearch(map: MapLibreMap) {
           map.flyTo({ center: [hit.lng, hit.lat], zoom: Math.max(map.getZoom(), 15) });
         }
         highlightParcel(map, hit.pin);
-        showParcel({
+        showParcel(map, {
           pin: hit.pin,
           o1: hit.o,
           o2: hit.o2,
@@ -525,15 +580,23 @@ async function boot() {
     $("close-parcel").addEventListener("click", () => hideParcel(map));
 
     map.on("click", (event) => {
-      if (site.active && handleSiteClick(map, [event.lngLat.lng, event.lngLat.lat])) {
-        for (const btn of document.querySelectorAll(".btn-row .ghost")) btn.classList.remove("active");
-        renderDistances();
-        $("status").textContent = site.marks.some((m) => m.kind === "structure")
-          ? "Structure placed · print when the distances look right"
-          : "Placed · add the structure to measure setbacks";
+      if (site.active) {
+        const placing = site.placeMode;
+        if (handleSiteClick(map, [event.lngLat.lng, event.lngLat.lat])) {
+          for (const btn of document.querySelectorAll(".btn-row .ghost")) btn.classList.remove("active");
+          syncSiteForm();
+          renderDistances();
+          if (placing) {
+            $("status").textContent = site.features.some((f) => f.kind === "structure")
+              ? "Structure placed · print when the distances look right"
+              : "Placed · add the structure to measure setbacks";
+          } else {
+            const selected = selectedFeature();
+            if (selected) $("status").textContent = `${selected.label} selected`;
+          }
+        }
         return;
       }
-      if (site.active) return;
       const feat = queryParcelFeature(map, event.point);
       if (!feat) {
         hideParcel(map);
@@ -541,7 +604,7 @@ async function boot() {
       }
       highlightParcel(map, feat.properties.pin);
       const fromIndex = findByPin(feat.properties.pin);
-      showParcel({
+      showParcel(map, {
         ...feat.properties,
         o1: feat.properties.o1 || fromIndex?.o || "",
         o2: feat.properties.o2 || fromIndex?.o2 || "",

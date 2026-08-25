@@ -185,3 +185,20 @@ export const PlanDocSchema = z.object({
   clientEditedAt: z.string().optional(),
 });
 export type PlanDoc = z.infer<typeof PlanDocSchema>;
+
+export function toParcelSnapshot(fields: ParcelSnapshot): ParcelSnapshot {
+  return {
+    pin: fields.pin,
+    o1: fields.o1,
+    o2: fields.o2,
+    acres: fields.acres,
+    cls: fields.cls,
+    value: fields.value,
+    tax: fields.tax,
+    deed: fields.deed,
+    land: fields.land,
+    addr: fields.addr,
+    addrs: fields.addrs,
+    naddr: fields.naddr,
+  };
+}

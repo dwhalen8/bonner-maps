@@ -1,8 +1,11 @@
 import type { GeoJSONSource, Map as MapLibreMap } from "maplibre-gl";
 import type { Feature, FeatureCollection, Point, Polygon, MultiPolygon, Position } from "geojson";
+import type { FeatureStatus, PlanDoc, PlanFeature } from "@shared/plan";
+import { PLAN_DOC_VERSION, toParcelSnapshot } from "@shared/plan";
 import type { ParcelProps } from "./types";
 import {
   compass,
+  feetBetween,
   formatFeet,
   inwardSetback,
   minDistToEdgeFt,
@@ -17,16 +20,6 @@ import { fetchZoningAt, ruleForZone, type SetbackRule } from "./setbacks";
 export type SiteKind = "structure" | "well" | "septic";
 export type PlaceMode = null | SiteKind;
 
-export interface SiteMark {
-  id: string;
-  kind: SiteKind;
-  label: string;
-  center: Position;
-  widthFt?: number;
-  lengthFt?: number;
-  rotationDeg?: number;
-}
-
 export interface SiteState {
   active: boolean;
   parcel: ParcelProps | null;
@@ -35,11 +28,23 @@ export interface SiteState {
   rule: SetbackRule;
   lineFt: number;
   accessory: boolean;
-  marks: SiteMark[];
+  features: PlanFeature[];
   selectedId: string | null;
   placeMode: PlaceMode;
+  status: FeatureStatus;
+  widthFt: number;
+  lengthFt: number;
+  rotationDeg: number;
   use: string;
   notes: string;
+  /** Frozen at startSitePlan; persist key. Not the inspector parcel. */
+  draftPin: string | null;
+}
+
+export interface SitePlanSession {
+  pin: string;
+  hadDraft: boolean;
+  lineFtAtStart: number;
 }
 
 export const site: SiteState = {
@@ -50,14 +55,109 @@ export const site: SiteState = {
   rule: ruleForZone(null),
   lineFt: 25,
   accessory: false,
-  marks: [],
+  features: [],
   selectedId: null,
   placeMode: null,
+  status: "proposed",
+  widthFt: 40,
+  lengthFt: 60,
+  rotationDeg: 0,
   use: "Single-family dwelling",
   notes: "",
+  draftPin: null,
 };
 
 const empty = (): FeatureCollection => ({ type: "FeatureCollection", features: [] });
+
+function draftKey(pin: string) {
+  return `bonner-anon-draft:${pin}`;
+}
+
+function featureCenter(feature: PlanFeature): Position | null {
+  return feature.geom.type === "Point" ? feature.geom.coordinates : null;
+}
+
+function defaultLabel(kind: SiteKind, status: FeatureStatus) {
+  if (kind === "structure") return status === "existing" ? "Existing structure" : "Proposed structure";
+  if (kind === "well") return status === "existing" ? "Existing well" : "Well";
+  return status === "existing" ? "Existing septic" : "Septic";
+}
+
+function structurePoly(feature: PlanFeature) {
+  const center = featureCenter(feature);
+  const width = feature.props.widthFt;
+  const length = feature.props.lengthFt;
+  if (!center || !width || !length) return null;
+  return rectanglePolygon(center, width, length, feature.props.rotationDeg ?? 0);
+}
+
+function isDraftFeature(value: unknown): value is PlanFeature {
+  if (!value || typeof value !== "object") return false;
+  const f = value as PlanFeature;
+  return typeof f.id === "string" && typeof f.kind === "string" && !!f.geom;
+}
+
+function loadDraft(pin: string): PlanDoc | null {
+  try {
+    const raw = localStorage.getItem(draftKey(pin));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as PlanDoc;
+    if (!parsed || parsed.pin !== pin) return null;
+    if (parsed.version != null && parsed.version !== PLAN_DOC_VERSION) return null;
+    if (!Array.isArray(parsed.features)) parsed.features = [];
+    parsed.features = parsed.features.filter(isDraftFeature).map((f) => ({
+      ...f,
+      status: f.status === "existing" ? "existing" : "proposed",
+      label: f.label || f.kind,
+      onPacket: f.onPacket !== false,
+      props: f.props ?? {},
+    }));
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+let persistTimer = 0;
+let sessionParcel: ParcelProps | null = null;
+
+export function persistDraft() {
+  window.clearTimeout(persistTimer);
+  persistTimer = 0;
+  const pin = site.draftPin;
+  if (!pin || !site.geom || !sessionParcel) return;
+  const now = new Date().toISOString();
+  const doc: PlanDoc = {
+    version: PLAN_DOC_VERSION,
+    pin,
+    title: site.use,
+    use: site.use,
+    notes: site.notes,
+    lineFt: site.lineFt,
+    accessory: site.accessory,
+    parcel: {
+      props: toParcelSnapshot(sessionParcel),
+      geom: site.geom,
+      snapshotAt: now,
+    },
+    features: site.features,
+    constraints: null,
+    checklist: [],
+    clientEditedAt: now,
+  };
+  try {
+    localStorage.setItem(draftKey(pin), JSON.stringify(doc));
+  } catch {
+    // private mode / quota — keep working in memory
+  }
+}
+
+export function schedulePersist() {
+  window.clearTimeout(persistTimer);
+  persistTimer = window.setTimeout(() => persistDraft(), 400);
+}
+
+window.addEventListener("pagehide", () => persistDraft());
 
 function setSrc(map: MapLibreMap, id: string, data: FeatureCollection) {
   const src = map.getSource(id) as GeoJSONSource | undefined;
@@ -129,13 +229,19 @@ export function addSiteLayers(map: MapLibreMap) {
       id: "site-structure-fill",
       type: "fill",
       source: "site-structure",
-      paint: { "fill-color": "#c1121f", "fill-opacity": 0.35 },
+      paint: {
+        "fill-color": ["match", ["get", "status"], "existing", "#6c757d", "#c1121f"],
+        "fill-opacity": 0.35,
+      },
     });
     map.addLayer({
       id: "site-structure-line",
       type: "line",
       source: "site-structure",
-      paint: { "line-color": "#6a040f", "line-width": 2 },
+      paint: {
+        "line-color": ["match", ["get", "status"], "existing", "#343a40", "#6a040f"],
+        "line-width": ["case", ["boolean", ["get", "selected"], false], 3.2, 2],
+      },
     });
     map.addLayer({
       id: "site-structure-label",
@@ -153,7 +259,7 @@ export function addSiteLayers(map: MapLibreMap) {
       type: "circle",
       source: "site-points",
       paint: {
-        "circle-radius": 6,
+        "circle-radius": ["case", ["boolean", ["get", "selected"], false], 7.5, 6],
         "circle-color": [
           "match",
           ["get", "kind"],
@@ -199,17 +305,62 @@ export function fitParcel(map: MapLibreMap, geom: Polygon | MultiPolygon) {
   );
 }
 
-export async function startSitePlan(
+function resetFormDefaults() {
+  site.use = "Single-family dwelling";
+  site.notes = "";
+  site.accessory = false;
+  site.lineFt = 25;
+  site.widthFt = 40;
+  site.lengthFt = 60;
+  site.rotationDeg = 0;
+  site.status = "proposed";
+  site.zoning = null;
+  site.rule = ruleForZone(null);
+}
+
+export function startSitePlan(
   map: MapLibreMap,
   parcel: ParcelProps,
   geom: Polygon | MultiPolygon,
-) {
+): SitePlanSession {
+  persistDraft();
+
   site.active = true;
+  site.draftPin = parcel.pin;
+  sessionParcel = parcel;
   site.parcel = parcel;
   site.geom = geom;
-  site.marks = [];
   site.selectedId = null;
   site.placeMode = null;
+  site.status = "proposed";
+  site.zoning = null;
+  site.rule = ruleForZone(null);
+
+  const draft = parcel.pin ? loadDraft(parcel.pin) : null;
+  if (draft) {
+    site.use = typeof draft.use === "string" && draft.use ? draft.use : "Single-family dwelling";
+    site.notes = typeof draft.notes === "string" ? draft.notes : "";
+    site.lineFt = typeof draft.lineFt === "number" ? draft.lineFt : 25;
+    site.accessory = Boolean(draft.accessory);
+    site.features = draft.features;
+    const lastStruct = [...site.features].reverse().find((f) => f.kind === "structure");
+    site.selectedId = lastStruct?.id ?? site.features.at(-1)?.id ?? null;
+    const selected = site.features.find((f) => f.id === site.selectedId);
+    if (selected) site.status = selected.status;
+    if (selected?.kind === "structure") {
+      site.widthFt = selected.props.widthFt ?? 40;
+      site.lengthFt = selected.props.lengthFt ?? 60;
+      site.rotationDeg = selected.props.rotationDeg ?? 0;
+    } else {
+      site.widthFt = 40;
+      site.lengthFt = 60;
+      site.rotationDeg = 0;
+    }
+  } else {
+    site.features = [];
+    resetFormDefaults();
+  }
+
   addSiteLayers(map);
   for (const id of ["parcels-line", "parcels-fill-private", "parcels-fill-public", "parcels-label", "county-outline"]) {
     if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", "none");
@@ -220,23 +371,42 @@ export async function startSitePlan(
   });
   fitParcel(map, geom);
   refreshOverlays(map);
-  const [lng, lat] = parcelCentroid(geom);
+  return {
+    pin: parcel.pin,
+    hadDraft: Boolean(draft),
+    lineFtAtStart: site.lineFt,
+  };
+}
+
+export async function refreshSiteZoning(map: MapLibreMap, session: SitePlanSession) {
+  if (!site.geom || site.draftPin !== session.pin) return;
+  const [lng, lat] = parcelCentroid(site.geom);
+  let zoning: string | null = null;
   try {
-    site.zoning = await fetchZoningAt(lng, lat);
+    zoning = await fetchZoningAt(lng, lat);
   } catch {
-    site.zoning = null;
+    zoning = null;
   }
+  if (!site.active || site.draftPin !== session.pin) return;
+  site.zoning = zoning;
   site.rule = ruleForZone(site.zoning);
-  if (!site.accessory) site.lineFt = site.rule.lineFt;
+  if (!session.hadDraft && !site.accessory && site.lineFt === session.lineFtAtStart) {
+    site.lineFt = site.rule.lineFt;
+  }
   refreshOverlays(map);
 }
 
 export function exitSitePlan(map: MapLibreMap) {
+  persistDraft();
   site.active = false;
+  site.draftPin = null;
+  sessionParcel = null;
   site.parcel = null;
   site.geom = null;
   site.placeMode = null;
-  site.marks = [];
+  site.features = [];
+  site.selectedId = null;
+  resetFormDefaults();
   clearSiteLayers(map);
   for (const id of ["parcels-line", "parcels-fill-private", "parcels-fill-public", "parcels-label", "county-outline"]) {
     if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", "visible");
@@ -245,37 +415,65 @@ export function exitSitePlan(map: MapLibreMap) {
 
 export function setLineSetback(map: MapLibreMap, feet: number) {
   site.lineFt = Math.max(0, feet);
+  schedulePersist();
   refreshOverlays(map);
 }
 
-export function addMark(kind: SiteKind, center: Position, extras: Partial<SiteMark> = {}) {
-  if (!site.geom || !pointInParcel(center, site.geom)) return null;
-  const id = `${kind}-${Date.now()}`;
-  const mark: SiteMark = {
-    id,
-    kind,
-    label:
-      extras.label ??
-      (kind === "structure" ? "Proposed structure" : kind === "well" ? "Well" : "Septic"),
-    center,
-    widthFt: extras.widthFt ?? (kind === "structure" ? 40 : undefined),
-    lengthFt: extras.lengthFt ?? (kind === "structure" ? 60 : undefined),
-    rotationDeg: extras.rotationDeg ?? 0,
-  };
-  site.marks.push(mark);
-  site.selectedId = id;
-  return mark;
+export function selectedFeature(): PlanFeature | undefined {
+  return site.features.find((f) => f.id === site.selectedId);
 }
 
-export function updateSelected(partial: Partial<SiteMark>) {
-  const mark = site.marks.find((m) => m.id === site.selectedId);
-  if (!mark) return;
-  Object.assign(mark, partial);
+export function addFeature(kind: SiteKind, center: Position, extras: Partial<PlanFeature> = {}) {
+  if (!site.geom || !pointInParcel(center, site.geom)) return null;
+  const status = extras.status ?? site.status;
+  const id = extras.id ?? `${kind}-${Date.now()}`;
+  const feature: PlanFeature = {
+    id,
+    kind,
+    status,
+    label: extras.label ?? defaultLabel(kind, status),
+    geom: { type: "Point", coordinates: center },
+    onPacket: extras.onPacket ?? true,
+    props: {
+      ...(kind === "structure"
+        ? { widthFt: site.widthFt, lengthFt: site.lengthFt, rotationDeg: site.rotationDeg }
+        : {}),
+      source: "user",
+      ...extras.props,
+    },
+  };
+  site.features.push(feature);
+  site.selectedId = id;
+  schedulePersist();
+  return feature;
+}
+
+export function updateSelected(
+  partial: Partial<PlanFeature["props"]> & { status?: FeatureStatus; label?: string },
+) {
+  const feature = selectedFeature();
+  if (!feature) return;
+  if (partial.widthFt != null) feature.props.widthFt = partial.widthFt;
+  if (partial.lengthFt != null) feature.props.lengthFt = partial.lengthFt;
+  if (partial.rotationDeg != null) feature.props.rotationDeg = partial.rotationDeg;
+  if (partial.eaveFt != null) feature.props.eaveFt = partial.eaveFt;
+  if (partial.useClass != null) feature.props.useClass = partial.useClass;
+  if (partial.source != null) feature.props.source = partial.source;
+  if (partial.notes != null) feature.props.notes = partial.notes;
+  if (partial.status) {
+    feature.status = partial.status;
+    if (feature.kind === "structure" || feature.kind === "well" || feature.kind === "septic") {
+      feature.label = defaultLabel(feature.kind, feature.status);
+    }
+  }
+  if (partial.label) feature.label = partial.label;
+  schedulePersist();
 }
 
 export function removeSelected() {
-  site.marks = site.marks.filter((m) => m.id !== site.selectedId);
-  site.selectedId = site.marks.at(-1)?.id ?? null;
+  site.features = site.features.filter((f) => f.id !== site.selectedId);
+  site.selectedId = site.features.at(-1)?.id ?? null;
+  schedulePersist();
 }
 
 export function refreshOverlays(map: MapLibreMap) {
@@ -286,24 +484,18 @@ export function refreshOverlays(map: MapLibreMap) {
     features: setback ? [setback] : [],
   });
 
-  const structure = site.marks.find((m) => m.kind === "structure");
-  const structurePoly =
-    structure && structure.widthFt && structure.lengthFt
-      ? rectanglePolygon(
-          structure.center,
-          structure.widthFt,
-          structure.lengthFt,
-          structure.rotationDeg ?? 0,
-        )
-      : null;
+  const structures = site.features.filter((f) => f.kind === "structure");
+  const measured =
+    structures.find((f) => f.id === site.selectedId) ?? structures[0];
+  const measuredPoly = measured ? structurePoly(measured) : null;
 
   const edges = parcelEdges(site.geom);
   setSrc(map, "site-edges", {
     type: "FeatureCollection",
     features: edges.map((edge) => {
       let label = `${formatFeet(edge.lengthFt)} ${compass(edge.bearing)}`;
-      if (structurePoly) {
-        const toBldg = minDistToEdgeFt(structurePoly, edge);
+      if (measuredPoly) {
+        const toBldg = minDistToEdgeFt(measuredPoly, edge);
         label = `${formatFeet(edge.lengthFt)} · ${formatFeet(toBldg)} to bldg`;
       }
       return {
@@ -316,50 +508,91 @@ export function refreshOverlays(map: MapLibreMap) {
 
   setSrc(map, "site-structure", {
     type: "FeatureCollection",
-    features: structurePoly
-      ? [
-          {
-            ...structurePoly,
-            properties: {
-              label: `${structure?.label ?? "Structure"} ${structure?.widthFt}×${structure?.lengthFt} ft`,
-            },
+    features: structures.flatMap((feature) => {
+      const poly = structurePoly(feature);
+      if (!poly) return [];
+      return [
+        {
+          ...poly,
+          properties: {
+            id: feature.id,
+            status: feature.status,
+            selected: feature.id === site.selectedId,
+            label: `${feature.label} ${feature.props.widthFt}×${feature.props.lengthFt} ft`,
           },
-        ]
-      : [],
+        },
+      ];
+    }),
   });
 
   setSrc(map, "site-points", {
     type: "FeatureCollection",
-    features: site.marks
-      .filter((m) => m.kind !== "structure")
-      .map(
-        (m): Feature<Point> => ({
-          type: "Feature",
-          properties: { kind: m.kind, label: m.label },
-          geometry: { type: "Point", coordinates: m.center },
-        }),
-      ),
+    features: site.features
+      .filter((f) => f.kind === "well" || f.kind === "septic")
+      .flatMap((f): Feature<Point>[] => {
+        const center = featureCenter(f);
+        if (!center) return [];
+        return [
+          {
+            type: "Feature",
+            properties: {
+              id: f.id,
+              kind: f.kind,
+              status: f.status,
+              selected: f.id === site.selectedId,
+              label: f.label,
+            },
+            geometry: { type: "Point", coordinates: center },
+          },
+        ];
+      }),
   });
 }
 
+function pickFeatureAt(lngLat: Position): PlanFeature | null {
+  for (let i = site.features.length - 1; i >= 0; i--) {
+    const feature = site.features[i];
+    if (feature.kind !== "structure") continue;
+    const poly = structurePoly(feature);
+    if (poly && pointInParcel(lngLat, poly.geometry)) return feature;
+  }
+  let best: PlanFeature | null = null;
+  let bestFt = 25;
+  for (const feature of site.features) {
+    if (feature.kind === "structure") continue;
+    const center = featureCenter(feature);
+    if (!center) continue;
+    const dist = feetBetween(center, lngLat);
+    if (dist < bestFt) {
+      bestFt = dist;
+      best = feature;
+    }
+  }
+  return best;
+}
+
 export function handleSiteClick(map: MapLibreMap, lngLat: Position) {
-  if (!site.active || !site.placeMode) return false;
-  const mark = addMark(site.placeMode, lngLat);
-  site.placeMode = null;
-  if (mark) refreshOverlays(map);
+  if (!site.active) return false;
+  if (site.placeMode) {
+    const feature = addFeature(site.placeMode, lngLat);
+    site.placeMode = null;
+    if (feature) refreshOverlays(map);
+    return true;
+  }
+  const hit = pickFeatureAt(lngLat);
+  if (!hit) return false;
+  site.selectedId = hit.id;
+  site.status = hit.status;
+  refreshOverlays(map);
   return true;
 }
 
 export function distanceSummary() {
   if (!site.geom) return [];
-  const structure = site.marks.find((m) => m.kind === "structure");
-  if (!structure?.widthFt || !structure.lengthFt) return [];
-  const poly = rectanglePolygon(
-    structure.center,
-    structure.widthFt,
-    structure.lengthFt,
-    structure.rotationDeg ?? 0,
-  );
+  const structures = site.features.filter((f) => f.kind === "structure");
+  const structure = structures.find((f) => f.id === site.selectedId) ?? structures[0];
+  const poly = structure ? structurePoly(structure) : null;
+  if (!poly) return [];
   return parcelEdges(site.geom)
     .filter((e) => e.lengthFt >= 15)
     .map((edge) => ({
