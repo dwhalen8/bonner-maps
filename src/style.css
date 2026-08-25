@@ -60,6 +60,7 @@ body { background: var(--bg); color: var(--ink); overflow: hidden; }
 .sheet.auth { max-height: none; }
 .sheet.auth .primary { margin-top: 8px; }
 .sheet.auth .check { margin-top: 12px; }
+#auth-link-wrap[hidden] { display: none; }
 @media (display-mode: standalone) {
   #auth-link-wrap { display: none !important; }
 }

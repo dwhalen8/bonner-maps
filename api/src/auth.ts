@@ -55,9 +55,15 @@ function smtpFromEnv(): SmtpEnv | null {
 }
 
 export function assertMailerForProduction(): void {
-  if (process.env.NODE_ENV === "production" && !smtpFromEnv()) {
+  if (process.env.NODE_ENV !== "production") return;
+  if (!smtpFromEnv()) {
     throw new Error(
       "SMTP_HOST and SMTP_FROM are required when NODE_ENV=production",
+    );
+  }
+  if (!appOrigin().startsWith("https:")) {
+    throw new Error(
+      "APP_ORIGIN must be an https origin when NODE_ENV=production",
     );
   }
 }
@@ -109,14 +115,24 @@ function clearSessionCookie(c: Context): void {
   c.header("Set-Cookie", cookieHeader("", 0));
 }
 
+function stripV4Mapped(ip: string): string {
+  return ip.replace(/^::ffff:/i, "");
+}
+
 function clientIp(c: Context): string {
+  // Prefer a hop nginx sets from $remote_addr — not client-supplied XFF[0].
+  const real = c.req.header("x-real-ip")?.trim();
+  if (real) return stripV4Mapped(real);
   const xff = c.req.header("x-forwarded-for");
   if (xff) {
-    const first = xff.split(",")[0]?.trim();
-    if (first) return first;
+    const hops = xff.split(",").map((s) => s.trim()).filter(Boolean);
+    const last = hops[hops.length - 1];
+    if (last) return stripV4Mapped(last);
   }
-  const real = c.req.header("x-real-ip")?.trim();
-  if (real) return real;
+  const peer = (
+    c.env as { incoming?: { socket?: { remoteAddress?: string } } } | undefined
+  )?.incoming?.socket?.remoteAddress?.trim();
+  if (peer) return stripV4Mapped(peer);
   return "0.0.0.0";
 }
 
@@ -503,6 +519,69 @@ function verifyByLinkToken(
   return { kind: "ok", raw };
 }
 
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (ch) => {
+    switch (ch) {
+      case "&":
+        return "&amp;";
+      case "<":
+        return "&lt;";
+      case ">":
+        return "&gt;";
+      case '"':
+        return "&quot;";
+      default:
+        return "&#39;";
+    }
+  });
+}
+
+function redirectLogin(c: Context, login: "ok" | "error") {
+  c.header("Location", `${appOrigin()}/?login=${login}`);
+  c.header("Referrer-Policy", "no-referrer");
+  c.header("Cache-Control", "no-store");
+  return c.body(null, 302);
+}
+
+function callbackConfirmPage(token: string): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Sign in — Bonner Bounds</title>
+  <style>
+    body { font-family: system-ui, sans-serif; background: #0b1510; color: #eef3ea; margin: 0; min-height: 100vh; display: grid; place-items: center; }
+    form { background: rgba(11, 21, 16, 0.92); border: 1px solid rgba(232, 240, 230, 0.14); border-radius: 16px; padding: 24px; max-width: 22rem; }
+    p { color: #9aa894; line-height: 1.4; }
+    button { width: 100%; height: 44px; border: 0; border-radius: 12px; background: #ff4d2e; color: #fff; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <form method="post" action="/api/auth/callback">
+    <input type="hidden" name="token" value="${escapeHtml(token)}">
+    <p>Continue signing in to Bonner Bounds on this device?</p>
+    <button type="submit">Continue</button>
+  </form>
+</body>
+</html>`;
+}
+
+async function readCallbackToken(c: Context): Promise<string> {
+  const fromQuery = (c.req.query("token") ?? "").trim();
+  const ct = c.req.header("content-type") ?? "";
+  if (ct.includes("application/x-www-form-urlencoded") || ct.includes("multipart/form-data")) {
+    try {
+      const body = await c.req.parseBody();
+      if (typeof body.token === "string" && body.token.trim()) return body.token.trim();
+    } catch {
+      /* fall through */
+    }
+  }
+  return fromQuery;
+}
+
 function sessionUser(db: Db, raw: string | undefined) {
   if (!raw) return null;
   const row = db
@@ -599,21 +678,24 @@ export function mountAuth(api: Hono, db: Db): void {
   });
 
   api.get("/auth/callback", (c) => {
-    const token = c.req.query("token") ?? "";
-    if (!token) {
-      return fail(c, 400, "Missing token", "bad_request");
-    }
+    const token = (c.req.query("token") ?? "").trim();
+    if (!token) return redirectLogin(c, "error");
+    // GET does not consume — mail scanners / Safe Links stop here.
+    return c.html(callbackConfirmPage(token), 200, {
+      "Referrer-Policy": "no-referrer",
+      "Cache-Control": "no-store",
+    });
+  });
+
+  api.post("/auth/callback", async (c) => {
+    const token = await readCallbackToken(c);
+    if (!token) return redirectLogin(c, "error");
     const ip = clientIp(c);
     const userAgent = c.req.header("user-agent");
     const result = db.transaction(() => verifyByLinkToken(db, token, ip, userAgent))();
-    if (result.kind === "rate") {
-      return fail(c, 429, "Too many attempts. Try again later.", "rate_limited");
-    }
-    if (result.kind === "invalid") {
-      return fail(c, 401, "Invalid code", "invalid_otp");
-    }
+    if (result.kind !== "ok") return redirectLogin(c, "error");
     setSessionCookie(c, result.raw);
-    return c.redirect(`${appOrigin()}/?login=ok`, 302);
+    return redirectLogin(c, "ok");
   });
 
   api.post("/auth/logout", (c) => {

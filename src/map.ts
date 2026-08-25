@@ -29,9 +29,9 @@ function baseStyle(): maplibregl.StyleSpecification {
 export function stripLoginQuery(): void {
   const url = new URL(window.location.href);
   if (!url.searchParams.has("login")) return;
-  if (url.searchParams.get("login") === "ok") {
-    sessionStorage.setItem("loginOk", "1");
-  }
+  const login = url.searchParams.get("login");
+  if (login === "ok") sessionStorage.setItem("loginOk", "1");
+  if (login === "error") sessionStorage.setItem("loginError", "1");
   url.searchParams.delete("login");
   const search = url.searchParams.toString();
   history.replaceState(null, "", `${url.pathname}${search ? `?${search}` : ""}${url.hash}`);

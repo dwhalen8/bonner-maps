@@ -423,6 +423,13 @@ async function refreshSession() {
   const user = await me();
   renderAuth(user);
   if (sessionStorage.getItem("loginOk")) sessionStorage.removeItem("loginOk");
+  if (sessionStorage.getItem("loginError")) {
+    sessionStorage.removeItem("loginError");
+    if (!user) {
+      $("auth-panel").hidden = false;
+      $("auth-status").textContent = "That sign-in link is invalid or already used.";
+    }
+  }
 }
 
 function bindAuthChrome() {

@@ -21,6 +21,7 @@ services:
     environment:
       DATABASE_PATH: /data/bonner.sqlite
       UPLOAD_DIR: /data/uploads
+      # Production (NODE_ENV=production in the image) requires https APP_ORIGIN.
       APP_ORIGIN: ${APP_ORIGIN:-http://localhost}
       PLANNING_ENABLED: ${PLANNING_ENABLED:-1}
       SMTP_HOST: ${SMTP_HOST:-}
