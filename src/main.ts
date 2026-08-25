@@ -47,6 +47,7 @@ import {
   type SiteKind,
 } from "./siteplan";
 import { formatFeet } from "./geo";
+import { PRINT_IOS_HINT, renderPrintBlock } from "./packet";
 import type { Polygon, MultiPolygon } from "geojson";
 import { findByPin, loadSearchIndex, searchParcels } from "./search";
 import {
@@ -107,7 +108,7 @@ function renderDistances() {
   const list = $("site-distances");
   list.replaceChildren();
   const rows = distanceSummary();
-  const advisories = [...wellSepticAdvisory(), ...encroachmentAdvisory(null)];
+  const advisories = [...wellSepticAdvisory(), ...encroachmentAdvisory(site.constraints?.roads ?? null)];
   if (!rows.length && !advisories.length) {
     list.innerHTML = "<li>Place a structure to measure setbacks to each lot line.</li>";
     return;
@@ -127,29 +128,12 @@ function renderDistances() {
   }
 }
 
-function fillPrintBlock() {
-  const p = site.parcel;
-  const when = new Date().toLocaleDateString();
-  $("print-meta").textContent = [
-    p?.o1,
-    p?.addr,
-    p?.pin ? `PIN ${p.pin}` : "",
-    p?.acres ? acres(Number(p.acres)) : "",
-    site.zoning ? `Zoning: ${site.zoning}` : "",
-    `Setback used: ${site.lineFt} ft`,
-    `Use: ${site.use}`,
-    when,
-  ]
-    .filter(Boolean)
-    .join("  ·  ");
-  $("print-measures").textContent = [
-    ...distanceSummary({ all: true }).map(
-      (row) =>
-        `${row.structureLabel} (eave ${formatFeet(row.eaveFt)}) · ${row.side}: ${formatFeet(row.toBldgFt)} to projection`,
-    ),
-    ...wellSepticAdvisory(),
-  ].join("   ");
-  $("print-notes").textContent = site.notes;
+function fillPrintBlock(map: MapLibreMap) {
+  document.documentElement.classList.toggle("print-letter", $<HTMLInputElement>("print-letter").checked);
+  renderPrintBlock(map, {
+    disturbance: $<HTMLInputElement>("site-disturbance").checked,
+    steepSlopes: $<HTMLInputElement>("site-slopes").checked,
+  });
 }
 
 function syncViewToggle() {
@@ -410,8 +394,12 @@ function bindSitePlan(map: MapLibreMap) {
     }
   });
 
+  $("print-letter").addEventListener("change", () => {
+    document.documentElement.classList.toggle("print-letter", $<HTMLInputElement>("print-letter").checked);
+  });
+  $("print-hint").textContent = PRINT_IOS_HINT;
   $("print-sitemap").addEventListener("click", () => {
-    fillPrintBlock();
+    fillPrintBlock(map);
     map.resize();
     window.setTimeout(() => window.print(), 250);
   });

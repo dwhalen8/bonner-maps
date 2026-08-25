@@ -45,7 +45,7 @@
         <ul id="search-results" hidden></ul>
       </form>
 
-      <div class="north no-print" aria-hidden="true">N</div>
+      <div class="north" aria-hidden="true">N</div>
       <div class="fab-col no-print">
         <button id="layers-btn" class="fab" title="Layers" aria-label="Layers">☰</button>
         <button id="locate-btn" class="fab" title="My location" aria-label="My location">◎</button>
@@ -181,27 +181,75 @@
         <label>Notes
           <textarea id="site-notes" rows="2" placeholder="Driveway, shoreline, slope, wetlands, existing buildings…"></textarea>
         </label>
+        <label class="check">
+          <input id="site-disturbance" type="checkbox" /> Disturbance above stormwater threshold (BCRC 12-720)
+        </label>
+        <label class="check">
+          <input id="site-slopes" type="checkbox" /> Mapped steep slopes on site (BCRC 12-760)
+        </label>
+        <label class="check">
+          <input id="print-letter" type="checkbox" /> Print on Letter (8.5×11)
+        </label>
         <button id="print-sitemap" class="primary">Print / save PDF</button>
+        <p class="hint" id="print-hint">
+          On iPhone: Print → Paper Size → Tabloid / 11×17 if you want that sheet. Letter still works; use the labeled distances.
+        </p>
         <p class="disclaimer">
           Draft only. BCRC 11-105 requires distances from the structure’s greatest
           projections to every property line and environmental features. Architectural
           projections cannot enter the setback. Confirm setbacks in Tables 12-411 /
-          12-412. This is not a survey.
+          12-412. This is not a survey. This is not the official BLP application.
         </p>
       </section>
 
       <aside id="print-block" class="print-only">
-        <h1>Bonner County Building Location Permit — Site Plan (draft)</h1>
-        <p id="print-meta"></p>
-        <p id="print-measures"></p>
-        <p id="print-notes"></p>
-        <p class="print-disclaimer">
-          Assessor parcel map, not a land survey. Distances are from greatest
-          projections (eaves/decks) and are approximate. Architectural projections
-          cannot enter the setback. Confirm setbacks, floodplain, shorelines, and
-          wetlands with Bonner County Planning (208-265-1458) before construction.
-          Official application: bonnercountyid.gov/building-location-permit
-        </p>
+        <section class="print-title-block">
+          <h1>Bonner County Building Location Permit — Site Plan (draft)</h1>
+          <dl id="print-meta" class="print-meta"></dl>
+          <p id="print-scale"></p>
+          <p id="print-setback-note"></p>
+          <table id="print-measures-table">
+            <thead>
+              <tr>
+                <th>Structure</th>
+                <th>Eave</th>
+                <th>Lot line</th>
+                <th>Line length</th>
+                <th>To projection</th>
+              </tr>
+            </thead>
+            <tbody id="print-measures"></tbody>
+          </table>
+          <p id="print-advisories"></p>
+          <p id="print-water"></p>
+          <p id="print-notes"></p>
+          <div class="print-sign">
+            <label>Owner signature <span class="line"></span></label>
+            <label>Date <span class="line"></span></label>
+          </div>
+          <p class="print-disclaimer">
+            Assessor parcel map, not a land survey. Distances are from greatest
+            projections (eaves/decks) and are approximate. Architectural projections
+            cannot enter the setback. Confirm setbacks, floodplain, shorelines, and
+            wetlands with Bonner County Planning (208-265-1458) before construction.
+            This is not the official BLP application. File at
+            bonnercountyid.gov/building-location-permit. NWI wetlands are inventory,
+            not a delineation. FEMA NFHL is not a floodplain development permit.
+            This app does not file a Building Location Permit.
+          </p>
+        </section>
+        <section class="print-checklist">
+          <h2>BLP remaining items</h2>
+          <p class="print-check-note">
+            County permits are never marked issued here. Incomplete GIS clips do not
+            clear an item. Print the site plan from this screen; attach floor plans,
+            elevations, and the recorded deed with the county filing.
+          </p>
+          <h3>Always required</h3>
+          <ul id="print-check-always"></ul>
+          <h3>Often needed</h3>
+          <ul id="print-check-often"></ul>
+        </section>
       </aside>
 
       <footer class="chrome bottom no-print">
