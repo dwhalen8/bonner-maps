@@ -10,6 +10,11 @@
   },
   "dependencies": {
     "@hono/node-server": "^2.1.1",
+    "@turf/bbox": "^7.4.0",
+    "@turf/bbox-clip": "^7.4.0",
+    "@turf/buffer": "^7.4.0",
+    "@turf/helpers": "^7.4.0",
+    "@turf/intersect": "^7.4.0",
     "better-sqlite3": "^13.0.3",
     "hono": "^4.13.4",
     "zod": "^4.4.3"
