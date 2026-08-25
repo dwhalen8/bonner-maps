@@ -1,9 +1,60 @@
 # Dokploy: create a Compose service and point it at this file.
 # Attach your domain in the Dokploy UI (Let's Encrypt). Do not publish
-# host port 80 — Dokploy's proxy reaches the container on port 80.
+# host port 80 — Dokploy's proxy reaches the web container on port 80.
 services:
   web:
     build: .
     restart: unless-stopped
     expose:
       - "80"
+    # Start-order only. Do NOT wait on api health — that takes the public map down.
+    depends_on:
+      api:
+        condition: service_started
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    restart: unless-stopped
+    expose:
+      - "3000"
+    environment:
+      DATABASE_PATH: /data/bonner.sqlite
+      UPLOAD_DIR: /data/uploads
+      # Production (NODE_ENV=production in the image) requires https APP_ORIGIN.
+      APP_ORIGIN: ${APP_ORIGIN:-http://localhost}
+      PLANNING_ENABLED: ${PLANNING_ENABLED:-1}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+    volumes:
+      - plan-data:/data
+  backup:
+    image: keinos/sqlite3:latest
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_started
+    volumes:
+      - plan-data:/data
+      - plan-backups:/backups
+    # 1) .backup on plan-data = SQLite corruption hedge only.
+    # 2) Copy sqlite + tar of uploads onto plan-backups (different volume).
+    # 3) Off-box: operator docker cp / Dokploy download / Hostinger snapshot (unverified).
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mkdir -p /data/backups /data/uploads /backups
+        while true; do
+          D=$$(date -u +%Y%m%d)
+          sqlite3 /data/bonner.sqlite ".backup /data/backups/bonner-$$D.sqlite"
+          sqlite3 /data/bonner.sqlite ".backup /backups/bonner-$$D.sqlite"
+          tar -C /data -cf /backups/uploads-$$D.tar uploads || true
+          find /data/backups /backups -mtime +14 -delete
+          sleep 86400
+        done
+volumes:
+  plan-data:
+  plan-backups:

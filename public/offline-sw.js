@@ -37,10 +37,11 @@ async function cacheFirst(request, name) {
 
 self.addEventListener("fetch", (event) => {
   if (event.request.method !== "GET") return;
+  const url = new URL(event.request.url);
+  if (url.pathname.startsWith("/api/")) return;
   const name = cacheNameFor(event.request.url);
   if (!name) return;
   // Keep Vite module graph live while developing.
-  const url = new URL(event.request.url);
   if (url.pathname.startsWith("/src/") || url.pathname.startsWith("/@") || url.pathname.includes("node_modules")) {
     return;
   }

@@ -3,6 +3,18 @@ import "./style.css";
 import type { Map as MapLibreMap } from "maplibre-gl";
 import type { DataMeta, ParcelProps } from "./types";
 import { LAND_LABELS } from "./types";
+import { logout, me, requestOtp, verifyOtp, type Me } from "./auth";
+import { toParcelSnapshot } from "@shared/plan";
+import {
+  claimPlan,
+  draftHasWork,
+  planByPin,
+  pullPlans,
+  setPlanStoreHooks,
+  type ConflictChoice,
+  type RevConflict,
+  type StoredPlan,
+} from "./plan-store";
 import {
   addDataLayers,
   addLocationDot,
@@ -15,26 +27,35 @@ import {
   queryParcelFeature,
   setBasemap,
   setLayerVisible,
+  stripLoginQuery,
   updateLocation,
   type BasemapId,
 } from "./map";
 import { fetchConstraintOverlays, incompleteConstraintMessage, type ConstraintClip } from "./constraints";
 import {
+  ackServerRev,
+  applyClaimedPlan,
   canFinishDraw,
+  clearAnonDraft,
   DEFAULT_EAVE_FT,
   distanceSummary,
+  docForClaim,
   drawPrompt,
+  dropClaimed,
   exitSitePlan,
   finishDrawing,
+  flushPersist,
   handleSiteClick,
   isDrawKind,
   parseUseClass,
+  peekAnonDraft,
   shouldPreventDrawZoom,
   refreshOverlays,
   refreshSiteZoning,
   removeSelected,
   schedulePersist,
   selectedFeature,
+  setClaimed,
   setLineSetback,
   setPlaceMode,
   setView,
@@ -58,6 +79,9 @@ import {
 } from "./offline";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
+
+let currentUser: Me | null = null;
+let siteMap: MapLibreMap | null = null;
 
 function money(value: number) {
   if (!value) return "—";
@@ -223,7 +247,8 @@ async function openSitePlan(map: MapLibreMap, props: ParcelProps, geom: Polygon 
   $("siteplan-panel").hidden = false;
   $("constraint-layers").hidden = false;
   $("status").textContent = "Site plan · tap Place structure, then tap the lot";
-  const session = startSitePlan(map, props, geom);
+  const claimed = props.pin ? await planByPin(props.pin).catch(() => null) : null;
+  const session = startSitePlan(map, props, geom, claimed);
   fillZoneHint();
   syncSiteForm();
   syncDrawUi();
@@ -247,6 +272,86 @@ function syncDrawUi() {
   finish.disabled = !canFinishDraw();
 }
 
+function promptSignIn(message: string) {
+  $("auth-panel").hidden = false;
+  $("auth-status").textContent = message;
+  $("status").textContent = message;
+}
+
+function applyRemotePlan(plan: StoredPlan) {
+  const sameOpenPin = site.active && site.draftPin === plan.doc.pin;
+  const claimed = site.planId === plan.id;
+  const emptyAnon = sameOpenPin && !site.planId && !draftHasWork(peekAnonDraft(plan.doc.pin));
+  if (!claimed && !emptyAnon) return;
+  applyClaimedPlan(plan);
+  const map = siteMap;
+  if (site.active && map) {
+    refreshOverlays(map);
+    syncSiteForm();
+    renderDistances();
+  }
+}
+
+function bindClaimed(plan: StoredPlan) {
+  if (site.active && site.draftPin === plan.doc.pin) setClaimed(plan);
+}
+
+function bindSyncConflict() {
+  const queue: { resolve: (choice: ConflictChoice) => void }[] = [];
+
+  const show = () => {
+    const open = queue.length > 0;
+    $("sync-conflict").hidden = !open;
+    if (open) {
+      $("sync-conflict-msg").textContent = "Newer copy on server — Keep mine / Take server";
+      $("status").textContent = "Newer copy on server — Keep mine / Take server";
+    }
+  };
+
+  const choose = (choice: ConflictChoice) => {
+    queue.shift()?.resolve(choice);
+    show();
+  };
+
+  $("keep-mine").addEventListener("click", () => choose("keep"));
+  $("take-server").addEventListener("click", () => choose("take"));
+
+  return (_conflict: RevConflict) =>
+    new Promise<ConflictChoice>((resolve) => {
+      queue.push({ resolve });
+      show();
+    });
+}
+
+async function claimCurrentParcel(map: MapLibreMap) {
+  if (!currentUser) {
+    promptSignIn("Sign in to claim this parcel.");
+    return;
+  }
+  const pin = site.parcel?.pin || $("parcel-pin").textContent || "";
+  const found = pin ? parcelFeatureByPin(map, pin) : null;
+  if (!found) {
+    $("status").textContent = "Zoom in on the parcel, then try Claim this parcel again.";
+    return;
+  }
+  const props = { ...found.properties, ...site.parcel };
+  const geom = found.geometry;
+  $("status").textContent = "Claiming parcel…";
+  try {
+    const doc = docForClaim(props, geom);
+    const plan = await claimPlan({
+      pin: props.pin,
+      parcel: { props: toParcelSnapshot(props), geom },
+      doc,
+    });
+    clearAnonDraft(props.pin);
+    if (site.active && site.draftPin === props.pin) setClaimed(plan);
+    $("status").textContent = `Claimed PIN ${props.pin} · saved to this account`;
+  } catch (err) {
+    $("status").textContent = err instanceof Error ? err.message : "Could not claim parcel";
+  }
+}
+
 function bindSitePlan(map: MapLibreMap) {
   $("open-siteplan").addEventListener("click", () => {
     const pin = site.parcel?.pin || $("parcel-pin").textContent || "";
@@ -257,6 +362,10 @@ function bindSitePlan(map: MapLibreMap) {
     }
     const props = { ...found.properties, ...site.parcel };
     void openSitePlan(map, props, found.geometry);
+  });
+
+  $("claim-parcel").addEventListener("click", () => {
+    void claimCurrentParcel(map);
   });
 
   $("close-siteplan").addEventListener("click", () => {
@@ -630,8 +739,144 @@ async function loadMeta() {
   }
 }
 
+function isStandalonePwa(): boolean {
+  return (
+    window.matchMedia("(display-mode: standalone)").matches ||
+    window.matchMedia("(display-mode: fullscreen)").matches ||
+    Boolean((navigator as Navigator & { standalone?: boolean }).standalone)
+  );
+}
+
+function renderAuth(user: Me | null) {
+  $("signin-btn").hidden = Boolean(user);
+  $("signed-in").hidden = !user;
+  $("auth-panel").hidden = true;
+  if (user) $("signed-email").textContent = user.email;
+}
+
+async function refreshSession() {
+  const user = await me();
+  currentUser = user;
+  renderAuth(user);
+  if (sessionStorage.getItem("loginOk")) sessionStorage.removeItem("loginOk");
+  if (sessionStorage.getItem("loginError")) {
+    sessionStorage.removeItem("loginError");
+    if (!user) {
+      $("auth-panel").hidden = false;
+      $("auth-status").textContent = "That sign-in link is invalid or already used.";
+    }
+  }
+  if (user) {
+    void flushPersist()
+      .then(() => pullPlans())
+      .catch(() => undefined);
+  }
+}
+
+function bindAuthChrome() {
+  const panel = $("auth-panel");
+  const status = $("auth-status");
+  const emailInput = $<HTMLInputElement>("auth-email");
+  const codeInput = $<HTMLInputElement>("auth-code");
+  const sendBtn = $<HTMLButtonElement>("auth-send");
+  const verifyBtn = $<HTMLButtonElement>("auth-verify");
+  const linkWrap = $("auth-link-wrap");
+  const standalone = isStandalonePwa();
+  if (!standalone) linkWrap.hidden = false;
+
+  const includeLink = () =>
+    !standalone && $<HTMLInputElement>("auth-include-link").checked;
+
+  $("signin-btn").addEventListener("click", () => {
+    panel.hidden = !panel.hidden;
+  });
+  $("close-auth").addEventListener("click", () => {
+    panel.hidden = true;
+  });
+
+  async function sendCode() {
+    const email = emailInput.value.trim();
+    if (!email) {
+      status.textContent = "Enter your email.";
+      return;
+    }
+    sendBtn.disabled = true;
+    status.textContent = "Sending code…";
+    try {
+      await requestOtp(email, includeLink() || undefined);
+      status.textContent = "Code sent. Check email and type it here.";
+      codeInput.focus();
+    } catch (err) {
+      status.textContent = err instanceof Error ? err.message : "Could not send code.";
+    } finally {
+      sendBtn.disabled = false;
+    }
+  }
+
+  async function doVerify() {
+    const email = emailInput.value.trim();
+    const code = codeInput.value.trim();
+    if (!email || !code) {
+      status.textContent = "Email and code required.";
+      return;
+    }
+    verifyBtn.disabled = true;
+    status.textContent = "Verifying…";
+    try {
+      await verifyOtp(email, code);
+      status.textContent = "";
+      await refreshSession();
+    } catch (err) {
+      status.textContent = err instanceof Error ? err.message : "Could not verify.";
+    } finally {
+      verifyBtn.disabled = false;
+    }
+  }
+
+  $("auth-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (codeInput.value.trim()) void doVerify();
+    else void sendCode();
+  });
+  sendBtn.addEventListener("click", () => void sendCode());
+  verifyBtn.addEventListener("click", () => void doVerify());
+
+  $("signout-btn").addEventListener("click", async () => {
+    await logout();
+    currentUser = null;
+    renderAuth(null);
+  });
+}
+
 async function boot() {
+  stripLoginQuery();
   const map = createMap($("map"));
+  siteMap = map;
+  setPlanStoreHooks({
+    onStatus(msg) {
+      $("status").textContent = msg;
+    },
+    onConflict: bindSyncConflict(),
+    onReplace: applyRemotePlan,
+    onAck: ackServerRev,
+    onBound: bindClaimed,
+    onDropped: dropClaimed,
+    peekAnonDraft,
+    onUnauthorized() {
+      currentUser = null;
+      renderAuth(null);
+      promptSignIn("Sign in again to sync.");
+    },
+  });
+  bindAuthChrome();
+  void refreshSession();
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && currentUser) {
+      void flushPersist()
+        .then(() => pullPlans())
+        .catch(() => undefined);
+    }
+  });
   bindInstall();
   bindOffline();
   void refreshOfflineLabel();

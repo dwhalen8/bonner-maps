@@ -31,6 +31,18 @@ function baseStyle(): maplibregl.StyleSpecification {
   };
 }
 
+/** MapLibre hash: true fights leftover query params — strip ?login=ok before createMap. */
+export function stripLoginQuery(): void {
+  const url = new URL(window.location.href);
+  if (!url.searchParams.has("login")) return;
+  const login = url.searchParams.get("login");
+  if (login === "ok") sessionStorage.setItem("loginOk", "1");
+  if (login === "error") sessionStorage.setItem("loginError", "1");
+  url.searchParams.delete("login");
+  const search = url.searchParams.toString();
+  history.replaceState(null, "", `${url.pathname}${search ? `?${search}` : ""}${url.hash}`);
+}
+
 export function createMap(container: HTMLElement) {
   const map = new maplibregl.Map({
     container,

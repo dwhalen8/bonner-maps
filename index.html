@@ -31,8 +31,44 @@
             <small>Bonner County, Idaho</small>
           </div>
         </div>
-        <button id="install-btn" class="ghost" hidden>Add to phone</button>
+        <div class="header-actions">
+          <button id="signin-btn" class="ghost" type="button">Sign in</button>
+          <span id="signed-in" hidden>
+            <span id="signed-email"></span>
+            <button id="signout-btn" class="ghost" type="button">Sign out</button>
+          </span>
+          <button id="install-btn" class="ghost" hidden>Add to phone</button>
+        </div>
       </header>
+
+      <aside id="auth-panel" class="sheet auth no-print" hidden>
+        <button id="close-auth" class="icon-x" aria-label="Close sign in">×</button>
+        <h2>Sign in</h2>
+        <p class="hint">
+          Request the code from the same place you will type it (home-screen app vs Safari).
+        </p>
+        <form id="auth-form">
+          <label>Email
+            <input id="auth-email" type="email" autocomplete="username" inputmode="email" required />
+          </label>
+          <button id="auth-send" class="primary" type="button">Send code</button>
+          <label>Code
+            <input
+              id="auth-code"
+              type="text"
+              inputmode="numeric"
+              pattern="[0-9]*"
+              autocomplete="one-time-code"
+              maxlength="6"
+            />
+          </label>
+          <button id="auth-verify" class="primary" type="button">Verify</button>
+          <label id="auth-link-wrap" class="check" hidden>
+            <input id="auth-include-link" type="checkbox" /> email me a link
+          </label>
+          <p class="hint" id="auth-status"></p>
+        </form>
+      </aside>
 
       <form id="search-form" class="search no-print" autocomplete="off">
         <input
@@ -106,7 +142,10 @@
           Assessor map, not a survey. Lines can be off by many feet. Do not use this
           to set a fence or decide a property dispute.
         </p>
-        <button id="open-siteplan" class="primary">Make BLP site map</button>
+        <div class="btn-row parcel-actions">
+          <button id="open-siteplan" class="primary">Make BLP site map</button>
+          <button id="claim-parcel" class="ghost" type="button">Claim this parcel</button>
+        </div>
       </section>
 
       <section id="siteplan-panel" class="sheet siteplan no-print" hidden>
@@ -264,6 +303,14 @@
             <tbody id="print-measures-all"></tbody>
           </table>
         </section>
+      </aside>
+
+      <aside id="sync-conflict" class="sheet conflict no-print" hidden>
+        <p id="sync-conflict-msg">Newer copy on server — Keep mine / Take server</p>
+        <div class="btn-row">
+          <button id="keep-mine" class="primary" type="button">Keep mine</button>
+          <button id="take-server" class="ghost" type="button">Take server</button>
+        </div>
       </aside>
 
       <footer class="chrome bottom no-print">

@@ -21,7 +21,12 @@ export default defineConfig({
       workbox: {
         globPatterns: ["**/*.{js,css,html,svg,png,woff2,json,geojson,webmanifest}"],
         maximumFileSizeToCacheInBytes: 40 * 1024 * 1024,
+        navigateFallbackDenylist: [/^\/api/],
         runtimeCaching: [
+          {
+            urlPattern: /\/api\//,
+            handler: "NetworkOnly",
+          },
           {
             urlPattern: /\/data\//,
             handler: "CacheFirst",
@@ -75,8 +80,14 @@ export default defineConfig({
       },
     }),
   ],
+  resolve: {
+    alias: {
+      "@shared/plan": path.resolve(root, "shared/plan.ts"),
+    },
+  },
   server: {
     host: true,
     port: 5173,
+    proxy: { "/api": "http://127.0.0.1:3000" },
   },
 });

@@ -25,7 +25,8 @@
     "@turf/length": "^7.4.0",
     "@turf/nearest-point-on-line": "^7.4.0",
     "@turf/polygon-to-line": "^7.4.0",
-    "maplibre-gl": "^5.7.1"
+    "maplibre-gl": "^5.7.1",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/geojson": "7946.0.16",

@@ -10,7 +10,7 @@
     "types": ["vite/client", "vite-plugin-pwa/client"],
     "baseUrl": ".",
     "paths": {
-      "@shared/plan": ["shared/plan.ts"]
+      "@shared/plan": ["./shared/plan.ts"]
     }
   },
   "include": ["src", "shared"]
