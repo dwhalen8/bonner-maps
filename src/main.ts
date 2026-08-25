@@ -398,10 +398,23 @@ function bindSitePlan(map: MapLibreMap) {
     document.documentElement.classList.toggle("print-letter", $<HTMLInputElement>("print-letter").checked);
   });
   $("print-hint").textContent = PRINT_IOS_HINT;
+  let printRestoreView: PlanView | null = null;
   $("print-sitemap").addEventListener("click", () => {
+    printRestoreView = site.view;
+    site.view = "packet";
+    refreshOverlays(map);
+    syncViewToggle();
     fillPrintBlock(map);
     map.resize();
     window.setTimeout(() => window.print(), 250);
+  });
+  window.addEventListener("afterprint", () => {
+    if (!printRestoreView) return;
+    site.view = printRestoreView;
+    printRestoreView = null;
+    if (!site.active) return;
+    refreshOverlays(map);
+    syncViewToggle();
   });
 
   window.addEventListener("keydown", (event) => {

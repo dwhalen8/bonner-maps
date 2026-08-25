@@ -315,7 +315,7 @@ export function wellSepticAdvisory(): string[] {
   return [`Well–septic ${formatFeet(min)} — Panhandle Health commonly wants ${WELL_SEPTIC_ADVISORY_FT} ft`];
 }
 
-/** PR 6 will pass clipped road LineStrings. No overlay yet → false / no warning. */
+/** Uses the clipped Transportation merge (layers 3/4/5/7). ≤30 ft of a proposed driveway. */
 export function encroachmentAdvisory(roadFeatures?: FeatureCollection | Feature[] | null): string[] {
   const out: string[] = [];
   for (const feature of site.features) {

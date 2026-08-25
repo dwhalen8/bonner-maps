@@ -1,8 +1,7 @@
 import type { Feature, MultiPolygon, Polygon, Position } from "geojson";
 import type { Map as MapLibreMap } from "maplibre-gl";
-import { featureCollection, point } from "@turf/helpers";
+import { featureCollection } from "@turf/helpers";
 import buffer from "@turf/buffer";
-import distance from "@turf/distance";
 import intersect from "@turf/intersect";
 import type { LayerClip } from "./constraints";
 import { asPolygon, formatFeet, minDistToParcelFt, pointInParcel } from "./geo";
@@ -56,8 +55,9 @@ function layerOpenIfIncomplete(layer: LayerClip | null | undefined, hit: boolean
 }
 
 function incompleteNote(layer: LayerClip | null | undefined, hit: boolean) {
-  if (hit || !layer?.incomplete) return undefined;
-  return "verify — overlay incomplete";
+  if (hit) return undefined;
+  if (!layer || layer.incomplete) return "verify — overlay incomplete";
+  return undefined;
 }
 
 function isSfha(props: Record<string, unknown> | null | undefined) {
@@ -128,40 +128,33 @@ function item(
   return { id, label, required, status, ...extra };
 }
 
-export function scaleStatement(map: MapLibreMap) {
-  const assessor = "Assessor geometry — distances approximate, not to survey scale.";
-  try {
-    const bounds = map.getBounds();
-    const canvas = map.getCanvas();
-    const widthPx = canvas.clientWidth || canvas.width / (window.devicePixelRatio || 1);
-    const widthIn = widthPx / 96;
-    const midLat = (bounds.getSouth() + bounds.getNorth()) / 2;
-    const widthFt = distance(
-      point([bounds.getWest(), midLat]),
-      point([bounds.getEast(), midLat]),
-      { units: "feet" },
-    );
-    const ftPerIn = widthIn > 0 ? widthFt / widthIn : NaN;
-    if (!Number.isFinite(ftPerIn) || ftPerIn < 5 || ftPerIn > 250) {
-      return `NOT TO SCALE — use labeled distances. ${assessor}`;
-    }
-    return `1 in ≈ ${Math.round(ftPerIn)} ft at this zoom. ${assessor}`;
-  } catch {
-    return `NOT TO SCALE — use labeled distances. ${assessor}`;
-  }
+/** Screen canvas width is not the printed map; labeled distances are the source of truth. */
+export function scaleStatement(_map?: MapLibreMap) {
+  return "NOT TO SCALE — use labeled distances. Assessor geometry — distances approximate, not to survey scale.";
 }
 
-export function waterWithin300Labels() {
-  const water = site.constraints?.water;
-  if (!water) return [] as string[];
-  const names = water.features.map((feat) => {
+function waterFeatureLabels(water: LayerClip) {
+  return water.features.map((feat) => {
     const props = (feat.properties ?? {}) as Record<string, unknown>;
     const name = String(props.gnis_name || props.GNIS_NAME || "unnamed");
     const fcode = props.FCODE ?? props.fcode;
     return fcode != null && String(fcode) ? `${name} (FCODE ${fcode})` : name;
   });
-  if (water.incomplete) names.push("verify — water overlay incomplete");
-  return names;
+}
+
+/** Negative “no water” only after a finished, complete NHD clip. */
+export function waterCaption() {
+  const water = site.constraints?.water;
+  if (!water || water.incomplete) {
+    const names = water ? waterFeatureLabels(water) : [];
+    return names.length
+      ? `Water within ~300 ft (clipped NHD): ${names.join("; ")} (verify — overlay incomplete)`
+      : "Water within 300 ft: verify — overlay incomplete.";
+  }
+  const names = waterFeatureLabels(water);
+  return names.length
+    ? `Water within ~300 ft (clipped NHD): ${names.join("; ")}`
+    : "No clipped NHD water within 300 ft of the parcel envelope.";
 }
 
 export function buildChecklist(flags: PrintFlags): PacketChecklistItem[] {
@@ -299,9 +292,17 @@ function fillDl(dl: HTMLElement, rows: [string, string][]) {
   }
 }
 
-function fillTable(tbody: HTMLElement) {
+function fillTable(tbody: HTMLElement, compact: boolean) {
   tbody.replaceChildren();
-  const rows = distanceSummary({ all: true });
+  let rows = distanceSummary({ all: true });
+  if (compact) {
+    const seen = new Set<string>();
+    rows = rows.filter((row) => {
+      if (seen.has(row.structureId)) return false;
+      seen.add(row.structureId);
+      return true;
+    });
+  }
   if (!rows.length) {
     const tr = document.createElement("tr");
     const td = document.createElement("td");
@@ -375,8 +376,16 @@ export function renderPrintBlock(map: MapLibreMap, flags: PrintFlags) {
   const setback = $("print-setback-note");
   if (setback) setback.textContent = SETBACK_BUFFER_SENTENCE;
 
-  const tbody = $("print-measures");
-  if (tbody) fillTable(tbody);
+  const compact = $("print-measures");
+  if (compact) fillTable(compact, true);
+  const all = $("print-measures-all");
+  if (all) fillTable(all, false);
+  const tableNote = $("print-measures-note");
+  if (tableNote) {
+    tableNote.textContent = distanceSummary({ all: true }).length
+      ? "Closest lot line per structure. Every outer-ring edge is on the checklist page."
+      : "";
+  }
 
   const advisories = $("print-advisories");
   if (advisories) {
@@ -387,14 +396,7 @@ export function renderPrintBlock(map: MapLibreMap, flags: PrintFlags) {
   }
 
   const water = $("print-water");
-  if (water) {
-    const names = waterWithin300Labels();
-    water.textContent = names.length
-      ? `Water within ~300 ft (clipped NHD): ${names.join("; ")}`
-      : site.constraints?.water?.incomplete
-        ? "Water within 300 ft: verify — overlay incomplete."
-        : "No clipped NHD water within 300 ft of the parcel envelope.";
-  }
+  if (water) water.textContent = waterCaption();
 
   const notes = $("print-notes");
   if (notes) notes.textContent = site.notes ? `Notes: ${site.notes}` : "";

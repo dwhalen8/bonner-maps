@@ -520,16 +520,17 @@ export async function fetchConstraintOverlays(
   const { signal } = abort;
   const fetchedAt = nowIso();
 
+  const pending = (): LayerClip => emptyClip(undefined, { incomplete: true });
   const clip: ConstraintClip = {
     zoning: { zonedesc: zoningLabel, fetchedAt },
-    zoningFill: emptyClip(),
-    roads: emptyClip(),
-    drivewaysCounty: emptyClip(),
-    row: emptyClip(),
-    flood: emptyClip(),
-    wetlands: emptyClip(),
-    water: emptyClip(),
-    cityImpact: emptyClip(),
+    zoningFill: pending(),
+    roads: pending(),
+    drivewaysCounty: pending(),
+    row: pending(),
+    flood: pending(),
+    wetlands: pending(),
+    water: pending(),
+    cityImpact: pending(),
   };
 
   const roadParts: { layer: number; clip: LayerClip }[] = [];
